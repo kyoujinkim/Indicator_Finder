@@ -188,3 +188,150 @@ def generate_report(
             pd.DataFrame(boruta_rows).to_excel(writer, sheet_name="Boruta", index=False)
 
     print(f"Excel saved: {xlsx_path}")
+
+
+# --------------------------------------------------------------------------- #
+# Temporal Comparison Report
+# --------------------------------------------------------------------------- #
+
+_STATUS_ARROW = {"risen": "↑", "fallen": "↓", "stable": "=", "new": "NEW", "dropped": "DEL"}
+_SCORE_COLS = [
+    "rank", "final_score",
+    "continuous_score", "irf_score", "shock_score", "threshold_score",
+]
+
+
+def generate_comparison_report(
+    comparison: dict,
+    target_col: str = "price",
+    top_n: int = 20,
+    save: bool = True,
+) -> None:
+    """
+    Print and save the temporal importance-change report.
+
+    Parameters
+    ----------
+    comparison : output of compare_periods()
+    target_col : 'price' or 'eps'
+    top_n      : how many features to show in the main table
+    save       : whether to save CSV/Excel output
+    """
+    out_dir = _ensure_output_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    delta    = comparison["delta"].copy()
+    w_cur    = comparison["window_current"]
+    w_past   = comparison["window_past"]
+    scores_c = comparison["current"]
+    scores_p = comparison["past"]
+
+    if delta.empty:
+        print("No comparison data available.")
+        return
+
+    # Enrich with readable names
+    delta["sheet"], delta["indicator"] = zip(
+        *delta["feature"].map(_format_feature_name)
+    )
+
+    # ------------------------------------------------------------------ #
+    # Console Output
+    # ------------------------------------------------------------------ #
+    print("=" * 95)
+    print(f"  MFMEA Temporal Comparison | Target: {target_col.upper()}")
+    print(f"  Current : {w_cur[0].date()} → {w_cur[1].date()}")
+    print(f"  Past    : {w_past[0].date()} → {w_past[1].date()}")
+    print("=" * 95)
+
+    # --- Top movers (by |score_delta|) ---
+    movers = delta.dropna(subset=["score_delta"]).copy()
+    movers = movers[movers["status"] != "new"].sort_values("score_delta", key=abs, ascending=False)
+
+    print(f"\n{'':5} {'Cur':>5} {'Past':>5} {'ΔScore':>8} {'ΔRank':>7}  {'Dom.Change':<12}  Indicator")
+    print("-" * 95)
+    shown = 0
+    for _, row in movers.iterrows():
+        if shown >= top_n:
+            break
+        arrow = _STATUS_ARROW.get(row["status"], "?")
+        rank_c = f"#{int(row['rank_current'])}" if not pd.isna(row.get("rank_current")) else "  -"
+        rank_p = f"#{int(row['rank_past'])}"    if not pd.isna(row.get("rank_past"))    else "  -"
+        rd     = row["rank_delta"]
+        rd_str = f"+{int(rd)}" if rd > 0 else str(int(rd))
+        score_d = row["score_delta"]
+        sd_str = f"{score_d:+.4f}"
+        print(
+            f"  {arrow:<3} {rank_c:>5} {rank_p:>5} {sd_str:>8} {rd_str:>7}  {row['dominant_change']:<12}  "
+            f"{row['sheet']} | {row['indicator'][:45]}"
+        )
+        shown += 1
+
+    # --- Rising stars ---
+    risen = delta[delta["status"] == "risen"].nlargest(5, "score_delta")
+    if not risen.empty:
+        print(f"\n--- Rising Stars (score improved > +0.05) ---")
+        for _, row in risen.iterrows():
+            sheet, ind = _format_feature_name(row["feature"])
+            print(f"  ↑  #{int(row['rank_current']):<4} (+{row['score_delta']:.4f})  [{row['dominant_change']}]  {sheet} | {ind[:50]}")
+
+    # --- Falling stars ---
+    fallen = delta[delta["status"] == "fallen"].nsmallest(5, "score_delta")
+    if not fallen.empty:
+        print(f"\n--- Falling Stars (score dropped > -0.05) ---")
+        for _, row in fallen.iterrows():
+            sheet, ind = _format_feature_name(row["feature"])
+            print(f"  ↓  #{int(row['rank_current']):<4} ({row['score_delta']:.4f})  [{row['dominant_change']}]  {sheet} | {ind[:50]}")
+
+    # --- New / Dropped ---
+    new_feats = delta[delta["status"] == "new"]
+    dropped   = delta[delta["status"] == "dropped"]
+    if not new_feats.empty:
+        print(f"\n--- New Features (appeared in current window) ---")
+        for _, row in new_feats.iterrows():
+            sheet, ind = _format_feature_name(row["feature"])
+            print(f"  NEW  {sheet} | {ind[:60]}")
+    if not dropped.empty:
+        print(f"\n--- Dropped Features (absent in current window) ---")
+        for _, row in dropped.iterrows():
+            sheet, ind = _format_feature_name(row["feature"])
+            print(f"  DEL  {sheet} | {ind[:60]}")
+
+    # --- Per-path change summary ---
+    print(f"\n--- Average Per-Path Score Change ---")
+    for path in ("continuous", "irf", "shock", "threshold"):
+        col = f"{path}_delta"
+        if col in delta.columns:
+            avg = delta[col].mean()
+            print(f"  {path.capitalize():<12}: {avg:+.4f}")
+
+    print("=" * 95)
+
+    if not save:
+        return
+
+    # ------------------------------------------------------------------ #
+    # Save
+    # ------------------------------------------------------------------ #
+    csv_path = out_dir / f"mfmea_comparison_{target_col}_{timestamp}.csv"
+    delta.to_csv(csv_path, index=False)
+    print(f"\nComparison CSV saved: {csv_path}")
+
+    xlsx_path = out_dir / f"mfmea_comparison_{target_col}_{timestamp}.xlsx"
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        delta.to_excel(writer, sheet_name="Delta", index=False)
+
+        # Ranked current scores (key columns only)
+        if not scores_c.empty:
+            key_cols = [c for c in _SCORE_COLS if c in scores_c.columns]
+            scores_c[key_cols].to_excel(writer, sheet_name="Current_Scores")
+
+        # Ranked past scores
+        if not scores_p.empty:
+            key_cols = [c for c in _SCORE_COLS if c in scores_p.columns]
+            scores_p[key_cols].to_excel(writer, sheet_name="Past_Scores")
+
+        # Top movers sheet
+        movers.head(top_n).to_excel(writer, sheet_name="Top_Movers", index=False)
+
+    print(f"Comparison Excel saved: {xlsx_path}")

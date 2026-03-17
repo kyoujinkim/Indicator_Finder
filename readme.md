@@ -72,11 +72,11 @@ Since data's characteristics is different, way of impact can be very different. 
 
 
 
-\## 3. Methodology: Triple-Path Analysis
+\## 3. Methodology: Quad-Path Analysis
 
 
 
-지표의 성격에 따라 세 가지 분석 경로를 병렬로 수행합니다.
+지표의 성격에 따라 네 가지 분석 경로를 병렬로 수행합니다.
 
 
 
@@ -98,25 +98,39 @@ Since data's characteristics is different, way of impact can be very different. 
 
 
 
-\### B. Shock \& Event Analysis (일시적 충격)
+\### B. Impulse Response Function (충격-반응 지속성)
 
 
 
-발표 시점에 시장에 강한 충격을 주고 사라지거나, 변동성을 확대시키는 지표를 분석합니다.
+충격이 주가에 전파되어 소멸하기까지의 시간적 경로를 별도로 정량화합니다.
 
 
 
 \* \*\*Techniques:\*\*
 
-\* \*\*Impulse Response Function (IRF):\*\* 특정 지표의 충격이 몇 거래일 동안 주가에 잔류하는지 분석.
+\* \*\*VAR-IRF:\*\* 이변량 VAR(p) 모델을 적합하고, 지표 충격에 대한 주가의 기간별 반응을 추적합니다. AIC 기준으로 최적 시차를 자동 선택합니다.
+
+\* \*\*IRF Persistence Score:\*\* IRF 절댓값에 시차 가중치를 곱한 합산값으로, 충격이 장기간 잔류하는 지표일수록 높은 점수를 부여합니다.
+
+
+
+\### C. Shock \& Event Analysis (발표 충격)
+
+
+
+발표 시점에 시장에 강한 충격을 주고 사라지는 이벤트 드리븐 영향을 분석합니다. IRF와 달리 실제 발표 이벤트 기준의 초과수익률과 모델 기여도를 측정합니다.
+
+
+
+\* \*\*Techniques:\*\*
 
 \* \*\*Event Study:\*\* 지표 발표 전후 $T \\pm n$ 기간의 초과수익률(Abnormal Return) 계산.
 
-\* \*\*SHAP Value (Time-series):\*\* 머신러닝 모델에서 특정 시점의 지표가 예측값 변화에 기여한 정도를 수치화.
+\* \*\*SHAP Value (Time-series):\*\* XGBoost 모델에서 특정 시점의 지표가 예측값 변화에 기여한 정도를 수치화.
 
 
 
-\### C. Threshold / Indicator-Function Analysis (임계값 트리거)
+\### D. Threshold / Indicator-Function Analysis (임계값 트리거)
 
 
 
@@ -124,7 +138,7 @@ Since data's characteristics is different, way of impact can be very different. 
 
 
 
-\* \*\*Optimal Threshold Search:\*\* 분위수 그리드 탐색(quantile sweep)을 통해 지표를 두 레짐(above/below)으로 분할할 때 타겟 수익률 차이가 최대화되는 임계값 $T^*$를 자동으로 산출합니다. 레짐 분리의 통계적 유의성은 Welch t-test로 검증합니다.
+\* \*\*Optimal Threshold Search:\*\* 지표를 z-표준화한 뒤, 분위수 그리드 탐색(quantile sweep, 10th–90th percentile)을 통해 두 레짐(above/below)으로 분할할 때 타겟 수익률 차이가 최대화되는 임계값 $T^*$를 자동으로 산출합니다. 보고 시에는 원본 단위로 역변환합니다. 레짐 분리의 통계적 유의성은 Welch t-test로 검증합니다.
 
 \* \*\*Crossing Detection:\*\* $T^*$에 대한 상향 돌파(up-crossing)와 하향 이탈(down-crossing) 시점을 탐지합니다.
 
@@ -160,7 +174,7 @@ Transfer Entropy: 지표 $X$가 타겟 $Y$의 미래를 예측하는 데 미치�
 
 Boruta Algorithm: 무작위로 섞인 가짜 지표(Shadow Features)보다 성능이 우수한 실제 지표만을 엄격하게 선별합니다.
 
-Regime-Aware Selection: 시장 국면(상승/하락/횡보)에 따라 지표의 중요도를 동적으로 재산출합니다.
+Regime-Aware Selection: 시장 국면(상승/하락/횡보)에 따라 지표의 중요도를 동적으로 재산출합니다. 국면 탐지는 두 가지 방식을 지원합니다: `simple`(롤링 z-score 기반), `balanced`(33/66 분위수 기반, 기본값).
 
 
 
@@ -174,19 +188,21 @@ Regime-Aware Selection: 시장 국면(상승/하락/횡보)에 따라 지표의 
 
 
 
-1\. \*\*Preprocessing Engine\*\* (`src/preprocessor.py`): 엑셀 시트별 빈도 처리, 주간 리샘플링, 지표 유형별 정상화 변환 (Look-ahead bias 방지).
+1\. \*\*Preprocessing Engine\*\* (`src/preprocessor.py`): 엑셀 시트별 빈도 처리, 주간 리샘플링, 컬럼 태그 기반 정상화 변환(`[1d]`=diff, `[1%]`=pct\_change, `[100]`=diff-100). Look-ahead bias 방지.
 
 2\. \*\*Continuous Analysis\*\* (`src/continuous_analysis.py`): Granger Causality, Transfer Entropy, ElasticNet.
 
-3\. \*\*Shock Analysis\*\* (`src/shock_analysis.py`): VAR-IRF, Event Study, SHAP (XGBoost).
+3\. \*\*IRF Analysis\*\* (`src/irf_analysis.py`): 이변량 VAR-IRF, IRF Persistence Score. Continuous 경로와 독립적으로 분리 운영.
 
-4\. \*\*Threshold Analysis\*\* (`src/threshold_analysis.py`): Optimal threshold search, crossing detection, conditional forward returns, signal quality metrics (hit rate, info ratio, asymmetry, trigger score).
+4\. \*\*Shock Analysis\*\* (`src/shock_analysis.py`): Event Study (abnormal return), SHAP (XGBoost). IRF 분리 후 이벤트 드리븐 영향 측정에 집중.
 
-5\. \*\*Feature Discovery\*\* (`src/feature_selector.py`): Boruta, Mutual Information, Regime-Aware importance.
+5\. \*\*Threshold Analysis\*\* (`src/threshold_analysis.py`): z-표준화 후 최적 임계값 탐색, 돌파 이벤트 탐지, 조건부 선도 수익률, 신호 품질 지표(hit rate, info ratio, asymmetry, trigger score). 보고값은 원본 단위로 역변환.
 
-6\. \*\*Relation Scorer\*\* (`src/relation_scorer.py`): 세 경로(Continuous / Shock / Threshold) 점수를 가중합산하고 Boruta 보너스 및 MI 점수를 반영하여 최종 랭킹 산출.
+6\. \*\*Feature Discovery\*\* (`src/feature_selector.py`): Boruta, Mutual Information, Regime-Aware importance (balanced 분위수 방식 기본 적용).
 
-7\. \*\*Reporting\*\* (`src/reporter.py`): 콘솔 요약 + CSV + Excel (다중 시트) 저장.
+7\. \*\*Relation Scorer\*\* (`src/relation_scorer.py`): 네 경로(Continuous / IRF / Shock / Threshold) 점수를 가중합산하고 Boruta 보너스 및 MI 점수를 반영하여 최종 랭킹 산출.
+
+8\. \*\*Reporting\*\* (`src/reporter.py`): 콘솔 요약 (C/I/S/T 컬럼 표시) + CSV + Excel (다중 시트, Threshold\_Analysis 시트 포함) 저장.
 
 
 
@@ -194,10 +210,16 @@ Regime-Aware Selection: 시장 국면(상승/하락/횡보)에 따라 지표의 
 
 ```
 Final Score = 0.40 × Continuous_Score
-            + 0.30 × Shock_Score
+            + 0.10 × IRF_Score
+            + 0.20 × Shock_Score
             + 0.30 × Threshold_Score
             + 0.15  [if Boruta-confirmed]
             + 0.05 × MI_Score_norm
+
+IRF_Score       = IRF_persistence_norm
+
+Shock_Score     = 0.50 × |event_car|_norm
+                + 0.50 × shap_value_norm
 
 Threshold_Score = 0.40 × |regime_diff|_norm × (1 - pval)
                 + 0.40 × trigger_score
