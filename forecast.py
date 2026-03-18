@@ -31,14 +31,6 @@ from src.future_forecaster import (
     save_forecast_report,
 )
 
-_RATING_LABELS = {
-    "-2": "very bad",
-    "-1": "bad",
-     "0": "neutral",
-     "1": "good",
-     "2": "very good",
-}
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MFMEA Future Forecaster")
@@ -69,54 +61,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _short_name(feature: str) -> str:
-    """Strip sheet prefix (e.g. '일_주가__종가지수(변동률)' → '종가지수(변동률)')."""
-    if "__" in feature:
-        return feature.split("__", 1)[1]
-    return feature
-
-
-def prompt_feature_args(features: list[str], coefs: dict[str, float], expect: bool = False) -> dict[str, int]:
-    """
-    Interactively ask the user to rate each base indicator.
-    Shows the model's ElasticNet coefficient so the user understands the direction.
-    Pressing Enter (empty input) skips → treated as 0 (neutral).
-    """
-    if not expect:
-        feature_args = {feat: 0 for feat in features}
-        return feature_args
-
-    print("\n" + "=" * 65)
-    print("  Qualitative Indicator Assessment")
-    print("  Rate each indicator's current outlook:")
-    print("  -2 very bad  |  -1 bad  |  0 neutral  |  +1 good  |  +2 very good")
-    print("  (Press Enter to skip = neutral)")
-    print("=" * 65)
-
-    feature_args: dict[str, int] = {}
-
-    for feat in features:
-        coef = coefs.get(feat, 0.0)
-        direction = "+" if coef >= 0 else "-"
-        short = _short_name(feat)
-        while True:
-            try:
-                raw = input(f"  [{direction}] {short}: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n  (Interrupted — all remaining set to neutral)")
-                break
-            if raw == "":
-                feature_args[feat] = 0
-                break
-            if raw in _RATING_LABELS:
-                feature_args[feat] = int(raw)
-                break
-            print("    Enter a value from -2 to 2 (or press Enter to skip).")
-
-    print()
-    return feature_args
-
-
 def main():
     args = parse_args()
 
@@ -127,13 +71,13 @@ def main():
     t0 = time.time()
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
-    print("\n[1/4] Loading data...")
+    print("\n[1/3] Loading data...")
     indicators = load_indicators()
     equity = load_equity()
     print(f"      {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # ── 2. Build feature matrix ───────────────────────────────────────────────
-    print(f"\n[2/4] Building feature matrix (align={args.align})...")
+    print(f"\n[2/3] Building feature matrix (align={args.align})...")
     feature_matrix = build_feature_matrix(
         args.target, indicators, equity,
         align_method=args.align, stationary=True, threshold=False,
@@ -141,24 +85,13 @@ def main():
     n_features = feature_matrix.shape[1] - 2
     print(f"      {feature_matrix.shape[0]} rows x {n_features} features")
 
-    # ── 3. Select features & prompt for qualitative ratings ───────────────────
-    print(f"\n[3/4] Selecting top {args.top} base indicators...")
-    report = load_report(args.target)
-    comparison = load_comparison(args.target)
-    base_features = select_base_features(report, comparison, args.top)
-
-    # Fit model first so we can show coefficient direction during prompting
-    model_artifacts = fit_base_model(feature_matrix, args.target, base_features)
-
-    feature_args = prompt_feature_args(base_features, model_artifacts["coefs"], args.expect)
-
-    # ── 4. Run forecast ───────────────────────────────────────────────────────
-    print(f"[4/4] Running forecast (target={args.target})...")
+    # ── 3. Run forecast ───────────────────────────────────────────────────────
+    print(f"[3/3] Running forecast (target={args.target})...")
     result = run_forecast(
         feature_matrix,
+        expect=args.expect,
         target=args.target,
         top_n=args.top,
-        feature_args=feature_args,
         today=datetime.today(),
         ci_level=args.ci,
         verbose=True,

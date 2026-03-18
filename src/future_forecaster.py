@@ -125,6 +125,63 @@ def _load_events() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _short_name(feature: str) -> str:
+    """Strip sheet prefix (e.g. '일_주가__종가지수(변동률)' → '종가지수(변동률)')."""
+    if "__" in feature:
+        return feature.split("__", 1)[1]
+    return feature
+
+
+def prompt_feature_args(model_artifacts, features: list[str], coefs: dict[str, float], expect: bool = False) -> dict[str, int]:
+    """
+    Interactively ask the user to rate each base indicator.
+    Shows the model's ElasticNet coefficient so the user understands the direction.
+    Pressing Enter (empty input) skips → treated as 0 (neutral).
+    """
+    _RATING_LABELS = {
+        "-2": "very bad",
+        "-1": "bad",
+        "0": "neutral",
+        "1": "good",
+        "2": "very good",
+    }
+
+    if not expect:
+        feature_args = {feat: 0 for feat in features}
+        return feature_args
+
+    print("\n" + "=" * 65)
+    print("  Qualitative Indicator Assessment")
+    print("  Rate each indicator's current outlook:")
+    print("  -2 very bad  |  -1 bad  |  0 neutral  |  +1 good  |  +2 very good")
+    print("  (Press Enter to skip = neutral)")
+    print("=" * 65)
+
+    feature_args: dict[str, int] = {}
+    trail_ewma = model_artifacts.get("trailing_ewma", {})
+
+    for feat in features:
+        coef = coefs.get(feat, 0.0)
+        direction = "+" if coef >= 0 else "-"
+        short = _short_name(feat)
+        while True:
+            try:
+                raw = input(f"  [{direction}] {short} - Current EWMA Value {round(trail_ewma[feat],2)} :").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  (Interrupted — all remaining set to neutral)")
+                break
+            if raw == "":
+                feature_args[feat] = 0
+                break
+            if raw in _RATING_LABELS:
+                feature_args[feat] = int(raw)
+                break
+            print("    Enter a value from -2 to 2 (or press Enter to skip).")
+
+    print()
+    return feature_args
+
+
 def _active_windows(days_since: int) -> dict:
     """
     Return list of windows still active given days since event, based on simple week-based thresholds.
@@ -288,7 +345,7 @@ def fit_base_model(
 def _base_forecast(
     model_artifacts: dict,
     feature_args: dict[str, int] | None = None,
-) -> dict[str, float]:
+) -> tuple[dict, dict[str, float]]:
     """
     Project a base return estimate for each window.
 
@@ -310,6 +367,7 @@ def _base_forecast(
         + feature_args.get(f, 0) * _ARG_SCALE * feat_std.get(f, 0.0)
         for f in features
     ])
+    model_artifacts["nudge_ewma"] = dict(zip(features, ewma_vals))
 
     ewma_scaled = model_artifacts["scaler"].transform(ewma_vals.reshape(1, -1))
     weekly_signal = float(model_artifacts["model"].predict(ewma_scaled)[0])
@@ -319,7 +377,7 @@ def _base_forecast(
         n_weeks = days / 7.0
         result[window] = weekly_signal * n_weeks
 
-    return result
+    return model_artifacts, result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,8 +447,8 @@ def _event_adjustment(
 def run_forecast(
     feature_matrix: pd.DataFrame,
     target: str,
+    expect: bool = False,
     top_n: int = 10,
-    feature_args: dict[str, int] | None = None,
     today: datetime | None = None,
     ci_level: float = 0.95,
     verbose: bool = True,
@@ -450,7 +508,9 @@ def run_forecast(
     if verbose:
         print("[Forecast] Fitting ElasticNet base model...")
     model_artifacts = fit_base_model(feature_matrix, target, base_features)
-    base_returns = _base_forecast(model_artifacts, feature_args=feature_args)
+    feature_args = prompt_feature_args(model_artifacts, base_features, model_artifacts["coefs"], expect)
+
+    model_artifacts, base_returns = _base_forecast(model_artifacts, feature_args=feature_args)
 
     if verbose:
         n_nz = len(model_artifacts["nonzero_coefs"])
@@ -570,16 +630,18 @@ def print_forecast_report(result: dict) -> None:
                   f"{e['days_since']:>4}d ago  decay={e['decay_weight']:.3f}")
 
     model = result["base_model"]
+    ewma = model["trailing_ewma"]
     nz = sorted(model["nonzero_coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
     print(f"\n  Base Model Features (ElasticNet alpha={model['model'].alpha_:.4f}):")
-    print(f"  {'Coef':>8}  {'Arg':>5}  Feature")
-    print(f"  {'-' * 60}")
+    print(f"  {'Coef':>8}  {'Current':>12}  {'Expect':>5}  Feature")
+    print(f"  {'-' * 75}")
     for feat, coef in nz[:10]:
         arg_val = feature_args.get(feat, 0)
-        arg_str = f"{arg_val:+d} ({_ARG_LABEL.get(arg_val, '')})" if arg_val != 0 else "  0 (neutral)"
-        print(f"  {coef:>+8.4f}  {arg_str:<18}  {feat}")
+        arg_str = f"{arg_val:+d} ({_ARG_LABEL.get(arg_val, '')})" if arg_val != 0 else "  0"
+        cur_val = ewma.get(feat, float("nan"))
+        print(f"  {coef:>+8.4f}  {cur_val:>12.4f}  {arg_str:<16}  {feat}")
 
-    print(f"{'=' * 65}\n")
+    print(f"{'=' * 85}\n")
 
 
 def save_forecast_report(result: dict, save: bool = True) -> Path | None:
@@ -640,10 +702,20 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
 
     # ── Sheet 3: Model Coefs ─────────────────────────────────────────────────
     ws3 = wb.create_sheet("Model_Coefs")
-    coef_df = pd.DataFrame(
-        sorted(result["base_model"]["coefs"].items(), key=lambda x: abs(x[1]), reverse=True),
-        columns=["feature", "coef"],
-    )
+    model = result["base_model"]
+    feat_args = result.get("feature_args", {})
+    coef_rows = sorted(model["coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
+    coef_df = pd.DataFrame([
+        {
+            "feature": feat,
+            "coef": coef,
+            "current_ewma": model["trailing_ewma"].get(feat, float("nan")),
+            "nuged_ewma": model["nudge_ewma"].get(feat, float("nan")),
+            "expect": feat_args.get(feat, 0),
+            "expect_label": _ARG_LABEL.get(feat_args.get(feat, 0), ""),
+        }
+        for feat, coef in coef_rows
+    ])
     for r_idx, row in enumerate(dataframe_to_rows(coef_df, index=False, header=True), 1):
         ws3.append(row)
         if r_idx == 1:
