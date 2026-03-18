@@ -131,7 +131,7 @@ def build_feature_matrix(
             date_indexer = re.search(r"\{(.*?)\}", col)
             if date_indexer:
                 numbers = re.findall(r"\d+", date_indexer.group())
-                series.index = series.index - pd.offsets.MonthBegin() + pd.DateOffset(months=int(numbers[0]), day=int(numbers[1]))
+                series.index = series.index - pd.offsets.MonthBegin() + pd.DateOffset(months=int(numbers[0])) + pd.to_timedelta(int(numbers[1])-1, unit='D')
 
             aligned = align_to_equity(series, target_index, method=align_method)
             # Add Caption

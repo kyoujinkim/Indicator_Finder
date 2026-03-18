@@ -73,6 +73,11 @@ _WINDOW_TO_AR_COL: dict[str, str] = {
 
 # Qualitative arg → numeric nudge (fraction of trailing std)
 _ARG_SCALE = 0.5  # half a trailing std per arg unit
+
+# Horizon dampening exponent γ: signal scales as n_weeks^γ instead of linearly.
+# γ=1.0 → fully linear (original); γ=0.5 → square-root (strong dampening).
+# Default 0.6 balances short-horizon accuracy with long-horizon realism.
+HORIZON_DAMPENING: float = 0.6
 # Pre-event baseline length for abnormal-return calc
 BASELINE_WINDOW = 12  # weeks
 
@@ -113,15 +118,21 @@ def _load_events() -> pd.DataFrame:
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(":", 1)
-            if len(parts) != 2:
+            parts = line.split(":", 2)
+            if len(parts) >= 1:
+                name = parts[0].strip()
+            else:
                 continue
-            name = parts[0].strip()
-            try:
+            if len(parts) >= 2:
                 date = pd.to_datetime(parts[1].strip())
-                rows.append({"event_name": name, "event_date": date})
-            except Exception:
-                continue
+            else:
+                date = pd.NaT
+            if len(parts) >= 3:
+                prob = parts[2].strip()
+            else:
+                prob = 1
+            rows.append({"event_name": name, "event_date": date, "probability": prob})
+
     return pd.DataFrame(rows)
 
 
@@ -345,6 +356,7 @@ def fit_base_model(
 def _base_forecast(
     model_artifacts: dict,
     feature_args: dict[str, int] | None = None,
+    horizon_damp: float = HORIZON_DAMPENING,
 ) -> tuple[dict, dict[str, float]]:
     """
     Project a base return estimate for each window.
@@ -375,7 +387,7 @@ def _base_forecast(
     result: dict[str, float] = {}
     for window, days in WINDOWS.items():
         n_weeks = days / 7.0
-        result[window] = weekly_signal * n_weeks
+        result[window] = weekly_signal * (n_weeks ** horizon_damp)
 
     return model_artifacts, result
 
@@ -406,6 +418,7 @@ def _event_adjustment(
     for _, evt in events_df.iterrows():
         event_name: str = evt["event_name"]
         event_date: pd.Timestamp = evt["event_date"]
+        event_prob: float = evt['probability']
 
         days_since = (today - event_date.to_pydatetime()).days
         active = _active_windows(days_since)
@@ -424,7 +437,7 @@ def _event_adjustment(
         for _, (a, window) in enumerate(active.items()):
             ar_col = _WINDOW_TO_AR_COL[window]
             if ar_col in row.index and pd.notna(row[ar_col]):
-                contrib = float(row[ar_col]) * decay
+                contrib = float(row[ar_col]) * decay * event_prob
                 adjustments[a] += contrib
                 window_contrib[a] = contrib
 
@@ -434,6 +447,7 @@ def _event_adjustment(
                 "event_date": event_date.strftime("%Y-%m-%d"),
                 "days_since": days_since,
                 "decay_weight": round(decay, 4),
+                "probability": event_prob,
                 "window_contrib": window_contrib,
             })
 
@@ -451,6 +465,7 @@ def run_forecast(
     top_n: int = 10,
     today: datetime | None = None,
     ci_level: float = 0.95,
+    horizon_damp: float = HORIZON_DAMPENING,
     verbose: bool = True,
 ) -> dict:
     """
@@ -475,6 +490,10 @@ def run_forecast(
         Confidence level for prediction interval (default 0.95 = 95%).
         Interval width = z * residual_std * sqrt(n_weeks), where residual_std
         is the in-sample ElasticNet residual std and n_weeks is the horizon.
+    horizon_damp : float
+        Dampening exponent γ for long-horizon signal accumulation (default 0.6).
+        Base return = weekly_signal × n_weeks^γ.
+        γ=1.0 → fully linear; γ=0.5 → square-root scaling (strong dampening).
     verbose : bool
         Print progress.
 
@@ -510,7 +529,7 @@ def run_forecast(
     model_artifacts = fit_base_model(feature_matrix, target, base_features)
     feature_args = prompt_feature_args(model_artifacts, base_features, model_artifacts["coefs"], expect)
 
-    model_artifacts, base_returns = _base_forecast(model_artifacts, feature_args=feature_args)
+    model_artifacts, base_returns = _base_forecast(model_artifacts, feature_args=feature_args, horizon_damp=horizon_damp)
 
     if verbose:
         n_nz = len(model_artifacts["nonzero_coefs"])
@@ -525,7 +544,7 @@ def run_forecast(
     if verbose and events_used:
         for e in events_used:
             print(f"  · {e['event_name']} ({e['event_date']}, {e['days_since']}d ago, "
-                  f"decay={e['decay_weight']:.3f})")
+                  f"probability={e['probability']:.2f} decay={e['decay_weight']:.3f})")
 
     # ── Combine & build output table ─────────────────────────────────────────
     from scipy.stats import norm as _norm
@@ -627,7 +646,7 @@ def print_forecast_report(result: dict) -> None:
         print(f"\n  Active Events ({len(events)}):")
         for e in events:
             print(f"    · {e['event_name']:<28} {e['event_date']}  "
-                  f"{e['days_since']:>4}d ago  decay={e['decay_weight']:.3f}")
+                  f"{e['days_since']:>4}d ago  decay={e['decay_weight']:.3f}  prob={e['probability']:.2f}")
 
     model = result["base_model"]
     ewma = model["trailing_ewma"]
@@ -689,6 +708,7 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
                 "event_name": e["event_name"],
                 "event_date": e["event_date"],
                 "days_since": e["days_since"],
+                "probability": e["probability"],
                 "decay_weight": e["decay_weight"],
                 **{f"contrib_{w}": e["window_contrib"].get(w, 0.0) for w in WINDOWS},
             }

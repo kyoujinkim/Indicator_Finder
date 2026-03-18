@@ -22,10 +22,6 @@ from datetime import datetime
 from src.data_loader import load_indicators, load_equity
 from src.preprocessor import build_feature_matrix
 from src.future_forecaster import (
-    load_report,
-    load_comparison,
-    select_base_features,
-    fit_base_model,
     run_forecast,
     print_forecast_report,
     save_forecast_report,
@@ -57,6 +53,11 @@ def parse_args():
     parser.add_argument(
         "--ci", type=float, default=0.95, metavar="LEVEL",
         help="Confidence interval level (default: 0.95 = 95%%)",
+    )
+    parser.add_argument(
+        "--damp", type=float, default=0.9, metavar="GAMMA",
+        help="Horizon dampening exponent γ (default: 0.6). "
+             "1.0=linear, 0.5=square-root. Lower values shrink long-horizon estimates.",
     )
     return parser.parse_args()
 
@@ -94,6 +95,7 @@ def main():
         top_n=args.top,
         today=datetime.today(),
         ci_level=args.ci,
+        horizon_damp=args.damp,
         verbose=True,
     )
 

@@ -39,15 +39,21 @@ def load_events(path: Path = IMPACTS_FILE) -> pd.DataFrame:
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(":", 1)
-            if len(parts) != 2:
+            parts = line.split(":", 2)
+            if len(parts) >= 1:
+                name = parts[0].strip()
+            else:
                 continue
-            name = parts[0].strip()
-            try:
+            if len(parts) >= 2:
                 date = pd.to_datetime(parts[1].strip())
-            except Exception:
-                continue
-            rows.append({"event_name": name, "event_date": date})
+            else:
+                date = pd.NaT
+            if len(parts) >= 3:
+                prob = parts[2].strip()
+            else:
+                prob = 1
+            rows.append({"event_name": name, "event_date": date, "probability": prob})
+
     return pd.DataFrame(rows)
 
 
