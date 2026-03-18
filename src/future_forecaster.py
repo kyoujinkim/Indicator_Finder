@@ -1,68 +1,60 @@
 """
 Future Forecaster for MFMEA.
 ============================================================
-Two-step forecast architecture (see readme_future_forecast.md):
+Pure analytics module — no interactive I/O.
+See readme_future_forecast.md for architecture details.
 
+Two-step forecast:
   Step 1 - Base Trend Model
-    · Selects top-N indicators from report_{target} by final_score
-    · Excludes 'fallen' features via comparison_{target}
-    · Deduplicates by indicator name (highest score kept)
-    · Fits ElasticNetCV on historical stationary returns
-    · Per-feature EWMA (span=8w) represents current market state
-    · Optional qualitative assessment via --add_exp flag:
-        Each indicator can be rated -2..+2; the rating shifts its EWMA by
-        arg × std(feat) × 0.5 before prediction. The model's own coefficient
-        determines whether a positive rating raises or lowers the forecast.
-    · Weekly signal is accumulated linearly across forecast windows (1w..26w)
+    · select_base_features : pick top-N from report, filter fallen, deduplicate
+    · fit_base_model        : ElasticNetCV on stationary returns; EWMA current state
+    · _base_forecast        : weekly_signal × n_weeks^γ (dampened accumulation)
 
   Step 2 - Event Volatility Adjustment
-    · Parses data/impacts.txt for named macro events and dates
-    · For each event, computes days_since = today - event_date
-    · _active_windows(): for each forecast slot (1w/2w/4w/13w/26w), maps to
-        the time-shifted ar_ lookup column using:
-            w1 = abs(-(days_since + n_weeks*7) // 7)
-        so the ar_ column reflects the remaining horizon from today rather
-        than from the original event date.
-    · Abnormal return (ar_+Xw, Z-score units) is fetched from Equity_Summary,
-        multiplied by exponential decay weight (half_life=14d), then scaled by
-        target_series_std (trailing BASELINE_WINDOW=12w) to convert to return units.
-    · Contributions are summed across all active events per window.
+    · _load_events          : parse data/impacts.txt (name, date, probability)
+    · _active_windows       : time-shifted ar_ column mapping per forecast slot
+    · _event_adjustment     : decay × probability × ar_ × target_std per window
 
-Returns:
-  dict with keys:
-    'forecast'     : pd.DataFrame - windows x {base_return, event_adjustment,
-                                                total_return, direction,
-                                                magnitude_%, projected_value}
-    'base_model'   : dict - ElasticNet model, coefs, EWMA values, feature stds
-    'events_used'  : list[dict] - events that contributed with decay/contrib detail
-    'feature_args' : dict[str, int] - per-indicator qualitative ratings used
-    'windows'      : list[str]
+Public API:
+    prepare_model(feature_matrix, target, top_n)
+        -> (model_artifacts, base_features)   [call before prompting user]
+
+    run_forecast(feature_matrix, target, feature_args, top_n, today,
+                 ci_level, horizon_damp, verbose)
+        -> result dict
+
+    print_forecast_report(result)
+    save_forecast_report(result, save)
 """
 
 import glob
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm as _norm
 from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
-DATA_DIR = Path(__file__).parent.parent / "data"
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths & constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Forecast horizons: label → calendar days
+OUTPUT_DIR = Path(__file__).parent.parent / "output"
+DATA_DIR   = Path(__file__).parent.parent / "data"
+
+# Forecast horizons: label -> calendar days
 WINDOWS: dict[str, int] = {
-    "1w":  7,
+    "1w":   7,
     "2w":  14,
     "4w":  28,
     "13w": 91,
     "26w": 182,
 }
 
-# Map each window to the closest available return column in Equity_Summary
-# Use ret_+ (actual % returns) not ar_+ (Z-score abnormal returns)
+# Maps each forecast slot to the ar_ column in Equity_Summary
+# _active_windows returns the effective lookup window per slot after time-shifting
 _WINDOW_TO_AR_COL: dict[str, str] = {
     "1w":  "ar_+1w",
     "2w":  "ar_+2w",
@@ -71,47 +63,55 @@ _WINDOW_TO_AR_COL: dict[str, str] = {
     "26w": "ar_+8w",
 }
 
-# Qualitative arg → numeric nudge (fraction of trailing std)
-_ARG_SCALE = 0.5  # half a trailing std per arg unit
+_ARG_SCALE        = 0.5   # EWMA nudge per qualitative unit = 0.5 × feature std
+HORIZON_DAMPENING = 0.6   # γ: base_return = weekly_signal × n_weeks^γ
+BASELINE_WINDOW   = 12    # weeks of trailing target history for scaling event ar_
 
-# Horizon dampening exponent γ: signal scales as n_weeks^γ instead of linearly.
-# γ=1.0 → fully linear (original); γ=0.5 → square-root (strong dampening).
-# Default 0.6 balances short-horizon accuracy with long-horizon realism.
-HORIZON_DAMPENING: float = 0.6
-# Pre-event baseline length for abnormal-return calc
-BASELINE_WINDOW = 12  # weeks
+_ARG_LABEL = {-2: "very bad", -1: "bad", 0: "neutral", 1: "good", 2: "very good"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# I/O helpers (private)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _find_latest(pattern: str) -> Path:
-    """Return the lexicographically last file matching an output/ glob."""
     files = sorted(glob.glob(str(OUTPUT_DIR / pattern)))
     if not files:
-        raise FileNotFoundError(f"No output file found for pattern: {OUTPUT_DIR / pattern}")
+        raise FileNotFoundError(f"No output file found: {OUTPUT_DIR / pattern}")
     return Path(files[-1])
 
 
+def _load_tabular(pattern_csv: str, pattern_xlsx: str, sheet: str = "Delta") -> pd.DataFrame:
+    """Load the latest csv; fall back to the first sheet of xlsx if csv absent."""
+    try:
+        return pd.read_csv(_find_latest(pattern_csv))
+    except FileNotFoundError:
+        return pd.read_excel(_find_latest(pattern_xlsx), sheet_name=sheet)
+
+
 def load_report(target: str) -> pd.DataFrame:
-    path = _find_latest(f"mfmea_report_{target}_*.csv")
-    return pd.read_csv(path)
+    return _load_tabular(
+        f"mfmea_report_{target}_*.csv",
+        f"mfmea_report_{target}_*.xlsx",
+        sheet="Full_Ranking",
+    )
 
 
 def load_comparison(target: str) -> pd.DataFrame:
-    path = _find_latest(f"mfmea_comparison_{target}_*.csv")
-    return pd.read_csv(path)
+    return _load_tabular(
+        f"mfmea_comparison_{target}_*.csv",
+        f"mfmea_comparison_{target}_*.xlsx",
+        sheet="Delta",
+    )
 
 
 def _load_equity_summary(target: str) -> pd.DataFrame:
-    """Load Equity_Summary sheet from the latest event_impact xlsx."""
     path = _find_latest(f"mfmea_event_impact_{target}_*.xlsx")
     return pd.read_excel(path, sheet_name="Equity_Summary")
 
 
 def _load_events() -> pd.DataFrame:
-    """Parse data/impacts.txt → DataFrame[event_name, event_date]."""
+    """Parse data/impacts.txt -> DataFrame[event_name, event_date, probability]."""
     rows = []
     with open(DATA_DIR / "impacts.txt", encoding="utf-8") as f:
         for line in f:
@@ -119,138 +119,57 @@ def _load_events() -> pd.DataFrame:
             if not line:
                 continue
             parts = line.split(":", 2)
-            if len(parts) >= 1:
-                name = parts[0].strip()
-            else:
+            if len(parts) < 2:
                 continue
-            if len(parts) >= 2:
+            name = parts[0].strip()
+            try:
                 date = pd.to_datetime(parts[1].strip())
-            else:
-                date = pd.NaT
-            if len(parts) >= 3:
-                prob = parts[2].strip()
-            else:
-                prob = 1
+            except Exception:
+                continue
+            try:
+                prob = float(parts[2].strip()) if len(parts) >= 3 else 1.0
+            except ValueError:
+                prob = 1.0
             rows.append({"event_name": name, "event_date": date, "probability": prob})
-
     return pd.DataFrame(rows)
 
 
-def _short_name(feature: str) -> str:
-    """Strip sheet prefix (e.g. '일_주가__종가지수(변동률)' → '종가지수(변동률)')."""
-    if "__" in feature:
-        return feature.split("__", 1)[1]
-    return feature
+# ─────────────────────────────────────────────────────────────────────────────
+# Event window helpers (private)
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def prompt_feature_args(model_artifacts, features: list[str], coefs: dict[str, float], expect: bool = False) -> dict[str, int]:
+def _active_windows(days_since: int) -> dict[str, str]:
     """
-    Interactively ask the user to rate each base indicator.
-    Shows the model's ElasticNet coefficient so the user understands the direction.
-    Pressing Enter (empty input) skips → treated as 0 (neutral).
+    For each forecast slot (1w/2w/4w/13w/26w) return the time-shifted ar_ key.
+
+    Formula: w1 = abs(-(days_since + n*7) // 7)
+    Maps the remaining horizon from today to the nearest available ar_ column.
+    Slots whose effective w1 >= 26 are excluded (event too old for that window).
     """
-    _RATING_LABELS = {
-        "-2": "very bad",
-        "-1": "bad",
-        "0": "neutral",
-        "1": "good",
-        "2": "very good",
-    }
-
-    if not expect:
-        feature_args = {feat: 0 for feat in features}
-        return feature_args
-
-    print("\n" + "=" * 65)
-    print("  Qualitative Indicator Assessment")
-    print("  Rate each indicator's current outlook:")
-    print("  -2 very bad  |  -1 bad  |  0 neutral  |  +1 good  |  +2 very good")
-    print("  (Press Enter to skip = neutral)")
-    print("=" * 65)
-
-    feature_args: dict[str, int] = {}
-    trail_ewma = model_artifacts.get("trailing_ewma", {})
-
-    for feat in features:
-        coef = coefs.get(feat, 0.0)
-        direction = "+" if coef >= 0 else "-"
-        short = _short_name(feat)
-        while True:
-            try:
-                raw = input(f"  [{direction}] {short} - Current EWMA Value {round(trail_ewma[feat],2)} :").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n  (Interrupted — all remaining set to neutral)")
-                break
-            if raw == "":
-                feature_args[feat] = 0
-                break
-            if raw in _RATING_LABELS:
-                feature_args[feat] = int(raw)
-                break
-            print("    Enter a value from -2 to 2 (or press Enter to skip).")
-
-    print()
-    return feature_args
-
-
-def _active_windows(days_since: int) -> dict:
-    """
-    Return list of windows still active given days since event, based on simple week-based thresholds.
-        For example, an event 10 days ago would still influence 1w and 2w windows, but not 4w+.
-    """
-    # Adjust windows to reflect elapsed time
-    adjusted = {}
-    for a, n in zip(['1w', '2w', '4w', '13w', '26w'], [1, 2, 4, 13, 26]):
-        w1 = abs(-(days_since + n*7)//7)
+    adjusted: dict[str, str] = {}
+    for label, n in zip(["1w", "2w", "4w", "13w", "26w"], [1, 2, 4, 13, 26]):
+        w1 = abs(-(days_since + n * 7) // 7)
         if w1 < 1:
-            adjusted[a] = "1w"
+            adjusted[label] = "1w"
         elif w1 < 2:
-            adjusted[a] = "2w"
+            adjusted[label] = "2w"
         elif w1 < 4:
-            adjusted[a] = "4w"
+            adjusted[label] = "4w"
         elif w1 < 13:
-            adjusted[a] = "13w"
+            adjusted[label] = "13w"
         elif w1 < 26:
-            adjusted[a] = "26w"
-        else:
-            pass
-
-    return adjusted
-
-
-def get_active_windows(days_since: int) -> list[str | None]:
-    """
-    Returns a fixed-length list of windows (1w, 2w, 4w, 13w, 26w).
-    Preserves original logic: an event 10 days ago still influences the 1w position.
-    """
-    # These are the 'a' values from your original loop
-    window_steps = [1, 2, 4, 13, 26]
-    labels = ["1w", "2w", "4w", "13w", "26w"]
-
-    adjusted = []
-    for step, label in zip(window_steps, labels):
-        # This replicates your -(days_since + a*7)//7 logic
-        # which determines if the event is still 'active' for this specific step
-        is_active = (days_since + step * 7) // 7 > 0
-
-        # Your logic implies that as long as the calculation is positive,
-        # the window label is appended.
-        if is_active and (days_since // 7) < step:
-            adjusted.append(label)
-        else:
-            adjusted.append(None)
-
+            adjusted[label] = "26w"
+        # else: slot inactive — omit from dict
     return adjusted
 
 
 def _event_decay_weight(days_since: int, half_life: int = 14) -> float:
-    """Exponential decay: weight = exp(-λ * days_since), λ = ln2 / half_life."""
     lam = np.log(2) / half_life
-    return np.exp(-lam * days_since)
+    return float(np.exp(-lam * days_since))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: Select base indicators
+# Step 1 — Feature selection & model fitting
 # ─────────────────────────────────────────────────────────────────────────────
 
 def select_base_features(
@@ -259,37 +178,30 @@ def select_base_features(
     top_n: int,
 ) -> list[str]:
     """
-    Pick top_n features from report by final_score.
-    Exclude features marked 'fallen' in comparison (rank degraded significantly).
+    Pick top_n features by final_score, excluding 'fallen' and deduplicating
+    by indicator name (keeping the highest-scoring feature per indicator).
     """
-    # Build exclusion set from comparison
-    fallen = set()
+    fallen: set[str] = set()
     if "status" in comparison.columns:
         fallen = set(comparison.loc[comparison["status"] == "fallen", "feature"])
 
     candidates = (
         report[~report["feature"].isin(fallen)]
         .sort_values("final_score", ascending=False)
-        .head(top_n * 2)  # oversample, then deduplicate by indicator
+        .head(top_n * 2)
     )
 
-    # Deduplicate: keep highest-scoring feature per indicator name
-    seen_indicators: set[str] = set()
+    seen: set[str] = set()
     selected: list[str] = []
     for _, row in candidates.iterrows():
         ind = row.get("indicator", row["feature"])
-        if ind not in seen_indicators:
-            seen_indicators.add(ind)
+        if ind not in seen:
+            seen.add(ind)
             selected.append(row["feature"])
         if len(selected) >= top_n:
             break
-
     return selected
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Base trend model
-# ─────────────────────────────────────────────────────────────────────────────
 
 def fit_base_model(
     feature_matrix: pd.DataFrame,
@@ -297,61 +209,80 @@ def fit_base_model(
     base_features: list[str],
 ) -> dict:
     """
-    Fit ElasticNetCV on the base features against the stationary target return.
-    Returns model artefacts: scaler, model, selected_features, trailing_ewma.
+    Fit ElasticNetCV on selected features vs. stationary target returns.
+
+    Returns a model-artifacts dict with:
+      model, scaler, features, coefs, nonzero_coefs,
+      trailing_ewma, trailing_feat_std, trailing_std,
+      residual_std, nudge_ewma (populated after _base_forecast)
     """
-    # Intersect requested features with available columns
     available = [f for f in base_features if f in feature_matrix.columns]
     if not available:
         raise ValueError("None of the selected base features are present in the feature matrix.")
 
     df = feature_matrix[available + ["target"]].dropna()
-    X = df[available].values
-    y = df["target"].values
+    X  = df[available].values
+    y  = df["target"].values
 
-    scaler = StandardScaler()
+    scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     model = ElasticNetCV(
         l1_ratio=[0.1, 0.5, 0.7, 0.9, 1.0],
-        cv=5,
-        max_iter=5000,
-        random_state=42,
+        cv=5, max_iter=5000, random_state=42,
     )
     model.fit(X_scaled, y)
 
-    # EWMA of each feature for "current state" extrapolation
-    ewma_span = 8  # 8-week half-life for trend
+    ewma_span = 8
     trailing_ewma = {
-        feat: feature_matrix[feat].ewm(span=ewma_span).mean().iloc[-1]
-        for feat in available
+        f: float(feature_matrix[f].ewm(span=ewma_span).mean().iloc[-1])
+        for f in available
     }
-    # Per-feature trailing std — used to scale qualitative arg nudges
     trailing_feat_std = {
-        feat: float(feature_matrix[feat].dropna().std())
-        for feat in available
+        f: float(feature_matrix[f].dropna().std())
+        for f in available
     }
 
-    coefs = dict(zip(available, model.coef_))
-    nonzero = {f: c for f, c in coefs.items() if abs(c) > 1e-6}
-
-    # In-sample residual std — basis for prediction interval width
-    y_pred = model.predict(X_scaled)
-    residual_std = float(np.std(y - y_pred))
+    coefs    = dict(zip(available, model.coef_))
+    nonzero  = {f: c for f, c in coefs.items() if abs(c) > 1e-6}
+    residual_std = float(np.std(y - model.predict(X_scaled)))
 
     return {
-        "model": model,
-        "scaler": scaler,
-        "features": available,
-        "coefs": coefs,
-        "nonzero_coefs": nonzero,
-        "trailing_ewma": trailing_ewma,
+        "model":             model,
+        "scaler":            scaler,
+        "features":          available,
+        "coefs":             coefs,
+        "nonzero_coefs":     nonzero,
+        "trailing_ewma":     trailing_ewma,
         "trailing_feat_std": trailing_feat_std,
-        "trailing_std": float(np.std(y)),
-        "trailing_mean_y": float(np.mean(y[-8:])),  # recent 8-week mean return
-        "residual_std": residual_std,
+        "trailing_std":      float(np.std(y)),
+        "residual_std":      residual_std,
+        "nudge_ewma":        {},   # populated by _base_forecast
     }
 
+
+def prepare_model(
+    feature_matrix: pd.DataFrame,
+    target: str,
+    top_n: int = 10,
+) -> tuple[dict, list[str]]:
+    """
+    Convenience wrapper: load reports, select features, fit model.
+    Returns (model_artifacts, base_features).
+
+    Call this before prompting the user so coefs are available for display,
+    then pass the collected feature_args into run_forecast.
+    """
+    report     = load_report(target)
+    comparison = load_comparison(target)
+    features   = select_base_features(report, comparison, top_n)
+    artifacts  = fit_base_model(feature_matrix, target, features)
+    return artifacts, features
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 — Base forecast with qualitative nudge
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _base_forecast(
     model_artifacts: dict,
@@ -359,41 +290,34 @@ def _base_forecast(
     horizon_damp: float = HORIZON_DAMPENING,
 ) -> tuple[dict, dict[str, float]]:
     """
-    Project a base return estimate for each window.
+    Apply per-indicator qualitative nudges to EWMA values, run model prediction,
+    accumulate weekly signal across windows using dampened horizon scaling.
 
-    Each feature's EWMA is optionally nudged by a per-indicator qualitative
-    score (feature_args[feat] in -2..+2), shifting the effective current value
-    by  arg * trailing_std[feat] * _ARG_SCALE  before the model predicts.
-    The model's own coefficients then determine whether a positive nudge on a
-    given indicator raises or lowers the target forecast.
-
-    Returns {window: cumulative_return}.
+    Returns (updated model_artifacts, {window: base_return}).
     """
-    features = model_artifacts["features"]
-    feat_std = model_artifacts["trailing_feat_std"]
+    features     = model_artifacts["features"]
+    feat_std     = model_artifacts["trailing_feat_std"]
     feature_args = feature_args or {}
 
-    # Apply per-indicator arg nudge to EWMA values
-    ewma_vals = np.array([
+    nudged_ewma = np.array([
         model_artifacts["trailing_ewma"][f]
         + feature_args.get(f, 0) * _ARG_SCALE * feat_std.get(f, 0.0)
         for f in features
     ])
-    model_artifacts["nudge_ewma"] = dict(zip(features, ewma_vals))
+    model_artifacts["nudge_ewma"] = dict(zip(features, nudged_ewma))
 
-    ewma_scaled = model_artifacts["scaler"].transform(ewma_vals.reshape(1, -1))
-    weekly_signal = float(model_artifacts["model"].predict(ewma_scaled)[0])
+    X_scaled      = model_artifacts["scaler"].transform(nudged_ewma.reshape(1, -1))
+    weekly_signal = float(model_artifacts["model"].predict(X_scaled)[0])
 
-    result: dict[str, float] = {}
-    for window, days in WINDOWS.items():
-        n_weeks = days / 7.0
-        result[window] = weekly_signal * (n_weeks ** horizon_damp)
-
-    return model_artifacts, result
+    returns = {
+        w: weekly_signal * ((days / 7.0) ** horizon_damp)
+        for w, days in WINDOWS.items()
+    }
+    return model_artifacts, returns
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Event volatility adjustment
+# Step 3 — Event volatility adjustment
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _event_adjustment(
@@ -401,54 +325,48 @@ def _event_adjustment(
     today: datetime | None = None,
 ) -> tuple[dict[str, float], list[dict]]:
     """
-    Compute per-window event adjustment using Impact Decay.
-
-    Returns
-    -------
-    adjustments : {window: cumulative_ar_adjustment}
-    events_used : list of dicts with event metadata
+    For each recent event: decay × probability × ar_+Xw × target_std.
+    ar_ values are Z-scores; multiplying by target_std converts to return units.
     """
     if today is None:
         today = datetime.today()
 
-    events_df = _load_events()
-    adjustments: dict[str, float] = {w: 0.0 for w in WINDOWS}
+    events_df   = _load_events()
+    adjustments = {w: 0.0 for w in WINDOWS}
     events_used: list[dict] = []
 
     for _, evt in events_df.iterrows():
-        event_name: str = evt["event_name"]
-        event_date: pd.Timestamp = evt["event_date"]
-        event_prob: float = evt['probability']
+        event_name: str   = evt["event_name"]
+        event_date        = evt["event_date"]
+        event_prob: float = float(evt["probability"])
 
         days_since = (today - event_date.to_pydatetime()).days
-        active = _active_windows(days_since)
+        active     = _active_windows(days_since)
         if not active:
-            continue  # event too old to influence any window
+            continue
 
         decay = _event_decay_weight(days_since)
-
-        # Look up average abnormal return for this event name in Equity_Summary
         match = equity_summary[equity_summary["event_name"] == event_name]
         if match.empty:
             continue
 
-        row = match.iloc[0]
-        window_contrib: dict[str, float] = {}
-        for _, (a, window) in enumerate(active.items()):
-            ar_col = _WINDOW_TO_AR_COL[window]
+        row    = match.iloc[0]
+        contribs: dict[str, float] = {}
+        for slot, lookup_window in active.items():
+            ar_col = _WINDOW_TO_AR_COL[lookup_window]
             if ar_col in row.index and pd.notna(row[ar_col]):
-                contrib = float(row[ar_col]) * decay * event_prob
-                adjustments[a] += contrib
-                window_contrib[a] = contrib
+                c = float(row[ar_col]) * decay * event_prob
+                adjustments[slot] += c
+                contribs[slot]     = c
 
-        if window_contrib:
+        if contribs:
             events_used.append({
-                "event_name": event_name,
-                "event_date": event_date.strftime("%Y-%m-%d"),
-                "days_since": days_since,
+                "event_name":   event_name,
+                "event_date":   event_date.strftime("%Y-%m-%d"),
+                "days_since":   days_since,
+                "probability":  event_prob,
                 "decay_weight": round(decay, 4),
-                "probability": event_prob,
-                "window_contrib": window_contrib,
+                "window_contrib": contribs,
             })
 
     return adjustments, events_used
@@ -461,7 +379,8 @@ def _event_adjustment(
 def run_forecast(
     feature_matrix: pd.DataFrame,
     target: str,
-    expect: bool = False,
+    feature_args: dict[str, int] | None = None,
+    model_artifacts: dict | None = None,
     top_n: int = 10,
     today: datetime | None = None,
     ci_level: float = 0.95,
@@ -473,132 +392,101 @@ def run_forecast(
 
     Parameters
     ----------
-    feature_matrix : pd.DataFrame
-        Output of build_feature_matrix() - stationary indicator + target columns.
-    target : str
-        'price' or 'eps'.
-    top_n : int
-        Number of base indicators to use for the trend model.
-    feature_args : dict[str, int], optional
-        Per-indicator qualitative scores (-2=very bad .. +2=very good).
-        Each entry shifts that indicator's effective current EWMA value before
-        the model predicts, so the sign of the model's own coefficient
-        determines whether a positive outlook raises or lowers the forecast.
-    today : datetime, optional
-        Reference date for event decay (defaults to datetime.today()).
-    ci_level : float
-        Confidence level for prediction interval (default 0.95 = 95%).
-        Interval width = z * residual_std * sqrt(n_weeks), where residual_std
-        is the in-sample ElasticNet residual std and n_weeks is the horizon.
-    horizon_damp : float
-        Dampening exponent γ for long-horizon signal accumulation (default 0.6).
-        Base return = weekly_signal × n_weeks^γ.
-        γ=1.0 → fully linear; γ=0.5 → square-root scaling (strong dampening).
-    verbose : bool
-        Print progress.
+    feature_matrix  : output of build_feature_matrix()
+    target          : 'price' or 'eps'
+    feature_args    : per-indicator qualitative scores {feature: -2..+2}
+                      (collect via prompt_feature_args in forecast.py, or pass None)
+    model_artifacts : pre-fitted model from prepare_model(); re-fitted if None
+    top_n           : number of base indicators
+    today           : reference date (defaults to datetime.today())
+    ci_level        : confidence interval level (default 0.95)
+    horizon_damp    : γ exponent for horizon scaling (default HORIZON_DAMPENING)
+    verbose         : print progress
 
     Returns
     -------
-    dict with keys:
-        'forecast'      : pd.DataFrame  (includes ci_lower/ci_upper/proj_lower/proj_upper)
-        'base_model'    : dict
-        'events_used'   : list[dict]
-        'feature_args'  : dict[str, int]
-        'ci_level'      : float
-        'windows'       : list[str]
+    dict with keys: forecast, base_model, events_used, feature_args,
+                    ci_level, windows, current_value, target, today
     """
     if today is None:
         today = datetime.today()
 
-    # ── Load report outputs ───────────────────────────────────────────────────
     if verbose:
         print("[Forecast] Loading output reports...")
-    report = load_report(target)
-    comparison = load_comparison(target)
     equity_summary = _load_equity_summary(target)
 
-    # ── Step 1: Select base features ─────────────────────────────────────────
-    base_features = select_base_features(report, comparison, top_n)
-    if verbose:
-        print(f"[Forecast] Base features selected ({len(base_features)}): "
-              f"{base_features[:5]}{'...' if len(base_features) > 5 else ''}")
+    # Reuse pre-fitted model if supplied (avoids redundant refitting)
+    if model_artifacts is None:
+        report, comparison = load_report(target), load_comparison(target)
+        base_features      = select_base_features(report, comparison, top_n)
+        if verbose:
+            print(f"[Forecast] Base features selected ({len(base_features)}): "
+                  f"{base_features[:3]}...")
+        if verbose:
+            print("[Forecast] Fitting ElasticNet base model...")
+        model_artifacts = fit_base_model(feature_matrix, target, base_features)
 
-    # ── Step 2: Fit base model ────────────────────────────────────────────────
-    if verbose:
-        print("[Forecast] Fitting ElasticNet base model...")
-    model_artifacts = fit_base_model(feature_matrix, target, base_features)
-    feature_args = prompt_feature_args(model_artifacts, base_features, model_artifacts["coefs"], expect)
-
-    model_artifacts, base_returns = _base_forecast(model_artifacts, feature_args=feature_args, horizon_damp=horizon_damp)
+    model_artifacts, base_returns = _base_forecast(
+        model_artifacts, feature_args=feature_args, horizon_damp=horizon_damp
+    )
 
     if verbose:
         n_nz = len(model_artifacts["nonzero_coefs"])
-        print(f"[Forecast] Model: {n_nz}/{len(base_features)} features with non-zero coef, "
-              f"alpha={model_artifacts['model'].alpha_:.4f}, weekly_signal={list(base_returns.values())[0]:.4f}")
+        print(f"[Forecast] Model: {n_nz}/{len(model_artifacts['features'])} non-zero coefs, "
+              f"alpha={model_artifacts['model'].alpha_:.4f}, "
+              f"1w signal={list(base_returns.values())[0]:+.4f}")
 
-    # ── Step 3: Event adjustment ──────────────────────────────────────────────
     if verbose:
         print("[Forecast] Computing event volatility adjustment...")
     event_adj, events_used = _event_adjustment(equity_summary, today=today)
 
-    if verbose and events_used:
+    if verbose:
         for e in events_used:
             print(f"  · {e['event_name']} ({e['event_date']}, {e['days_since']}d ago, "
-                  f"probability={e['probability']:.2f} decay={e['decay_weight']:.3f})")
+                  f"prob={e['probability']:.2f}, decay={e['decay_weight']:.3f})")
 
-    # ── Combine & build output table ─────────────────────────────────────────
-    from scipy.stats import norm as _norm
-    z = float(_norm.ppf((1 + ci_level) / 2))
-    residual_std = model_artifacts["residual_std"]
+    # Combine base + event adjustment into forecast table
+    z             = float(_norm.ppf((1 + ci_level) / 2))
+    residual_std  = model_artifacts["residual_std"]
+    target_std    = float(feature_matrix["target"].dropna().iloc[-BASELINE_WINDOW:].std())
+    current_value = float(feature_matrix[target].dropna().iloc[-1])
 
-    target_series = feature_matrix["target"].dropna().iloc[-BASELINE_WINDOW:]
-    target_series_std = float(target_series.std())
-    current_price = float(feature_matrix[target].dropna().iloc[-1])
+    def _proj(r: float) -> float:
+        return round(current_value * (1 + r), 2)
+
     records = []
     for window, days in WINDOWS.items():
-        n_weeks = days / 7.0
-        base_ret = base_returns[window]
-        ev_adj = event_adj.get(window, 0.0) * target_series_std  # scale ar_ Z-scores to return units
+        n_weeks   = days / 7.0
+        base_ret  = base_returns[window]
+        ev_adj    = event_adj.get(window, 0.0) * target_std
         total_ret = base_ret + ev_adj
-
-        # CI: uncertainty widens with sqrt(horizon) — random-walk assumption
-        margin = z * residual_std * np.sqrt(n_weeks)
-        ci_lower = total_ret - margin
-        ci_upper = total_ret + margin
-
-        direction = "UP" if total_ret > 0 else ("DOWN" if total_ret < 0 else "FLAT")
-        magnitude = abs(total_ret)
-
-        def _proj(r: float) -> float:
-            return round(current_price * (1 + r), 2)
+        margin    = z * residual_std * np.sqrt(n_weeks)
 
         records.append({
-            "window": window,
-            "horizon_days": days,
-            "base_return": round(base_ret, 6),
+            "window":           window,
+            "horizon_days":     days,
+            "base_return":      round(base_ret, 6),
             "event_adjustment": round(ev_adj, 6),
-            "total_return": round(total_ret, 6),
-            "direction": direction,
-            "magnitude_%": round(magnitude * 100, 4),
-            "projected_value": _proj(total_ret),
-            "ci_lower": round(ci_lower, 6),
-            "ci_upper": round(ci_upper, 6),
-            "proj_lower": _proj(ci_lower),
-            "proj_upper": _proj(ci_upper),
+            "total_return":     round(total_ret, 6),
+            "direction":        "UP" if total_ret > 0 else ("DOWN" if total_ret < 0 else "FLAT"),
+            "magnitude_%":      round(abs(total_ret) * 100, 4),
+            "projected_value":  _proj(total_ret),
+            "ci_lower":         round(total_ret - margin, 6),
+            "ci_upper":         round(total_ret + margin, 6),
+            "proj_lower":       _proj(total_ret - margin),
+            "proj_upper":       _proj(total_ret + margin),
         })
 
-    forecast_df = pd.DataFrame(records).set_index("window")
-
     return {
-        "forecast": forecast_df,
-        "base_model": model_artifacts,
-        "events_used": events_used,
-        "feature_args": feature_args or {},
-        "ci_level": ci_level,
-        "windows": list(WINDOWS.keys()),
-        "current_value": current_price,
-        "target": target,
-        "today": today,
+        "forecast":      pd.DataFrame(records).set_index("window"),
+        "base_model":    model_artifacts,
+        "events_used":   events_used,
+        "feature_args":  feature_args or {},
+        "ci_level":      ci_level,
+        "windows":       list(WINDOWS.keys()),
+        "current_value": current_value,
+        "target":        target,
+        "today":         today,
     }
 
 
@@ -606,37 +494,30 @@ def run_forecast(
 # Report helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ARG_LABEL = {-2: "very bad", -1: "bad", 0: "neutral", 1: "good", 2: "very good"}
-
-
 def print_forecast_report(result: dict) -> None:
-    """Pretty-print the forecast result to stdout."""
-    target = result["target"]
-    today = result["today"]
-    current = result["current_value"]
-    feature_args: dict[str, int] = result.get("feature_args", {})
-    events = result["events_used"]
-
-    ci_level = result.get("ci_level", 0.95)
-    ci_pct = int(ci_level * 100)
+    target       = result["target"]
+    today        = result["today"]
+    current      = result["current_value"]
+    feature_args = result.get("feature_args", {})
+    events       = result["events_used"]
+    ci_pct       = int(result.get("ci_level", 0.95) * 100)
 
     print(f"\n{'=' * 85}")
     print(f"  MFMEA - Future {target.upper()} Forecast")
     print(f"  As of: {today.strftime('%Y-%m-%d')}  |  Current {target}: {current:,.2f}  |  CI: {ci_pct}%")
     print(f"{'=' * 85}")
-
     print(f"\n  {'Window':<6} {'Horizon':>8} {'Base':>9} {'EvtAdj':>9} "
-          f"{'Total':>9} {'Dir':>5} {'Projected':>12} "
-          f"{'Lower':>12} {'Upper':>12}  ({ci_pct}% CI)")
+          f"{'Total':>9} {'Dir':>5} {'Projected':>12} {'Lower':>12} {'Upper':>12}  ({ci_pct}% CI)")
     print(f"  {'-' * 95}")
 
     for window, row in result["forecast"].iterrows():
+        dir_str = "UP" if row["direction"] == "UP" else ("DN" if row["direction"] == "DOWN" else "--")
         print(
             f"  {window:<6} {row['horizon_days']:>6}d  "
             f"{row['base_return']:>+9.3%} "
             f"{row['event_adjustment']:>+9.3%} "
             f"{row['total_return']:>+9.3%} "
-            f"{'UP' if row['direction']=='UP' else 'DN' if row['direction']=='DOWN' else '--':>5} "
+            f"{dir_str:>5} "
             f"{row['projected_value']:>12,.2f} "
             f"{row['proj_lower']:>12,.2f} "
             f"{row['proj_upper']:>12,.2f}"
@@ -645,40 +526,36 @@ def print_forecast_report(result: dict) -> None:
     if events:
         print(f"\n  Active Events ({len(events)}):")
         for e in events:
-            print(f"    · {e['event_name']:<28} {e['event_date']}  "
-                  f"{e['days_since']:>4}d ago  decay={e['decay_weight']:.3f}  prob={e['probability']:.2f}")
+            print(f"    · {e['event_name']:<30} {e['event_date']}  "
+                  f"{e['days_since']:>4}d ago  prob={e['probability']:.2f}  decay={e['decay_weight']:.3f}")
 
     model = result["base_model"]
-    ewma = model["trailing_ewma"]
-    nz = sorted(model["nonzero_coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
+    nz    = sorted(model["nonzero_coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
     print(f"\n  Base Model Features (ElasticNet alpha={model['model'].alpha_:.4f}):")
-    print(f"  {'Coef':>8}  {'Current':>12}  {'Expect':>5}  Feature")
-    print(f"  {'-' * 75}")
+    print(f"  {'Coef':>8}  {'Current EWMA':>13}  {'Expect':<18}  Feature")
+    print(f"  {'-' * 80}")
     for feat, coef in nz[:10]:
         arg_val = feature_args.get(feat, 0)
-        arg_str = f"{arg_val:+d} ({_ARG_LABEL.get(arg_val, '')})" if arg_val != 0 else "  0"
-        cur_val = ewma.get(feat, float("nan"))
-        print(f"  {coef:>+8.4f}  {cur_val:>12.4f}  {arg_str:<16}  {feat}")
+        arg_str = f"{arg_val:+d} ({_ARG_LABEL.get(arg_val, '')})" if arg_val != 0 else "0"
+        cur_val = model["trailing_ewma"].get(feat, float("nan"))
+        print(f"  {coef:>+8.4f}  {cur_val:>13.4f}  {arg_str:<18}  {feat}")
 
     print(f"{'=' * 85}\n")
 
 
 def save_forecast_report(result: dict, save: bool = True) -> Path | None:
-    """Save forecast table to output/ as Excel."""
     if not save:
         return None
 
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     target = result["target"]
-    today = result["today"].strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"mfmea_forecast_{target}_{today}.xlsx"
+    path   = OUTPUT_DIR / f"mfmea_forecast_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
+    wb     = Workbook()
 
-    wb = Workbook()
-
-    # ── Sheet 1: Forecast ────────────────────────────────────────────────────
+    # Sheet 1: Forecast
     ws = wb.active
     ws.title = "Forecast"
     df = result["forecast"].reset_index()
@@ -686,12 +563,10 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
         ws.append(row)
         if r_idx == 1:
             for cell in ws[r_idx]:
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill("solid", fgColor="1F4E79")
-                cell.font = Font(bold=True, color="FFFFFF")
+                cell.font      = Font(bold=True, color="FFFFFF")
+                cell.fill      = PatternFill("solid", fgColor="1F4E79")
                 cell.alignment = Alignment(horizontal="center")
 
-    # Colour direction cells
     dir_col = df.columns.get_loc("direction") + 1
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=dir_col, max_col=dir_col):
         for cell in row:
@@ -700,15 +575,15 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
             elif cell.value == "DOWN":
                 cell.fill = PatternFill("solid", fgColor="FFC7CE")
 
-    # ── Sheet 2: Events Used ─────────────────────────────────────────────────
+    # Sheet 2: Events Used
     ws2 = wb.create_sheet("Events_Used")
     if result["events_used"]:
         events_df = pd.DataFrame([
             {
-                "event_name": e["event_name"],
-                "event_date": e["event_date"],
-                "days_since": e["days_since"],
-                "probability": e["probability"],
+                "event_name":   e["event_name"],
+                "event_date":   e["event_date"],
+                "days_since":   e["days_since"],
+                "probability":  e["probability"],
                 "decay_weight": e["decay_weight"],
                 **{f"contrib_{w}": e["window_contrib"].get(w, 0.0) for w in WINDOWS},
             }
@@ -720,21 +595,20 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
                 for cell in ws2[r_idx]:
                     cell.font = Font(bold=True)
 
-    # ── Sheet 3: Model Coefs ─────────────────────────────────────────────────
-    ws3 = wb.create_sheet("Model_Coefs")
-    model = result["base_model"]
-    feat_args = result.get("feature_args", {})
-    coef_rows = sorted(model["coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
-    coef_df = pd.DataFrame([
+    # Sheet 3: Model Coefs
+    ws3      = wb.create_sheet("Model_Coefs")
+    model    = result["base_model"]
+    fa       = result.get("feature_args", {})
+    coef_df  = pd.DataFrame([
         {
-            "feature": feat,
-            "coef": coef,
-            "current_ewma": model["trailing_ewma"].get(feat, float("nan")),
-            "nuged_ewma": model["nudge_ewma"].get(feat, float("nan")),
-            "expect": feat_args.get(feat, 0),
-            "expect_label": _ARG_LABEL.get(feat_args.get(feat, 0), ""),
+            "feature":       feat,
+            "coef":          coef,
+            "current_ewma":  model["trailing_ewma"].get(feat, float("nan")),
+            "nudged_ewma":   model["nudge_ewma"].get(feat, float("nan")),
+            "expect":        fa.get(feat, 0),
+            "expect_label":  _ARG_LABEL.get(fa.get(feat, 0), ""),
         }
-        for feat, coef in coef_rows
+        for feat, coef in sorted(model["coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
     ])
     for r_idx, row in enumerate(dataframe_to_rows(coef_df, index=False, header=True), 1):
         ws3.append(row)
