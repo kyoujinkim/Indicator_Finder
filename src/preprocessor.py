@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 from typing import Literal
 
+from dateutil.relativedelta import relativedelta
+
 
 def align_to_equity(
     indicator: pd.Series,
@@ -125,6 +127,12 @@ def build_feature_matrix(
             series = df[col].dropna()
             if len(series) < 5:
                 continue
+            # Find Date Indexers and Numbers for naming
+            date_indexer = re.search(r"\{(.*?)\}", col)
+            if date_indexer:
+                numbers = re.findall(r"\d+", date_indexer.group())
+                series.index = series.index - pd.offsets.MonthBegin() + pd.DateOffset(months=int(numbers[0]), day=int(numbers[1]))
+
             aligned = align_to_equity(series, target_index, method=align_method)
             # Add Caption
             if '[1d]' in col:
@@ -153,6 +161,7 @@ def build_feature_matrix(
                     aligned = make_stationary(aligned, method="pct_change")
                 else:
                     aligned = make_stationary(aligned, method="diff")
+
             col = re.sub(r"\[(.*?)\]", '', col).strip()
             col = re.sub(r"\{(.*?)\}", '', col).strip()
             aligned.name = f"{sheet_name}__{col}"
@@ -168,5 +177,4 @@ def build_feature_matrix(
     # Drop rows where all features are NaN
     feat_cols = [c for c in result.columns if c not in ("target", target)]
     result = result.dropna(subset=feat_cols, how="all")
-    result = result.dropna(subset=["price"])
     return result
