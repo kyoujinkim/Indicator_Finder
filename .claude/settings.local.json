@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(pip list:*)"
+      "Bash(pip list:*)",
+      "Bash(unzip:*)",
+      "Bash(conda run:*)",
+      "Bash(C:/Users/NHWM/miniconda3/envs/Indicator_Finder/python.exe forecast.py --target price --top 10 --arg 0)",
+      "Bash(python -c \":*)"
     ]
   }
 }
