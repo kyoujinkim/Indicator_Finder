@@ -8,9 +8,10 @@ Entry point. Orchestrates the full pipeline:
   3. Continuous Impact Analysis (Granger, Transfer Entropy, ElasticNet)
   4. IRF Analysis (VAR-IRF, persistence score)
   5. Shock & Event Analysis (Event Study, SHAP)
-  6. Threshold / Indicator-Function Analysis (optimal threshold, crossing events, signal quality)
-  7. Feature Selection (MI, Boruta, Regime-Aware)
-  8. Relation Scoring (aggregate → rank) + Report generation
+  6. Named-Event Impact Analysis (equity response + indicator tracking, data/impacts.txt)
+  7. Threshold / Indicator-Function Analysis (optimal threshold, crossing events, signal quality)
+  8. Feature Selection (MI, Boruta, Regime-Aware)
+  9. Relation Scoring (aggregate → rank) + Report generation
 
   --compare: additionally run a rolling-window temporal comparison
              to measure how importance changed over the past month.
@@ -28,10 +29,11 @@ from src.preprocessor import build_feature_matrix
 from src.continuous_analysis import run_continuous_analysis
 from src.irf_analysis import run_irf_analysis
 from src.shock_analysis import run_shock_analysis
+from src.event_impact import run_event_impact
 from src.threshold_analysis import run_threshold_analysis
 from src.feature_selector import run_feature_selection
 from src.relation_scorer import compute_relation_scores
-from src.reporter import generate_report, generate_comparison_report
+from src.reporter import generate_report, generate_comparison_report, generate_event_impact_report
 from src.temporal_comparison import compare_periods
 
 
@@ -66,21 +68,21 @@ def main():
 
     # ── 1. Load ──────────────────────────────────────────────────
     t0 = time.time()
-    print("\n[1/8] Loading data...")
+    print("\n[1/9] Loading data...")
     indicators = load_indicators()
     equity = load_equity()
     print(f"      Loaded {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # ── 2. Preprocess ─────────────────────────────────────────────
-    print(f"\n[2/8] Preprocessing (align={args.align})...")
+    print(f"\n[2/9] Preprocessing (align={args.align})...")
     feature_matrix = build_feature_matrix(
-        indicators, equity, align_method=args.align, stationary=True, threshold=False
+        args.target, indicators, equity, align_method=args.align, stationary=True, threshold=False
     )
     n_features = feature_matrix.shape[1] - 2  # minus price, eps
     print(f"      Feature matrix: {feature_matrix.shape[0]} rows × {n_features} features")
 
     # ── 3. Continuous Impact ──────────────────────────────────────
-    print(f"\n[3/8] Continuous impact analysis (target={args.target})...")
+    print(f"\n[3/9] Continuous impact analysis (target={args.target})...")
     continuous = run_continuous_analysis(
         feature_matrix, target_col=args.target, max_lag=args.max_lag
     )
@@ -88,29 +90,37 @@ def main():
     print(f"      {sig_count}/{len(continuous)} features Granger-significant at p<0.05")
 
     # ── 4. IRF Analysis ───────────────────────────────────────────
-    print(f"\n[4/8] IRF analysis...")
+    print(f"\n[4/9] IRF analysis...")
     irf = run_irf_analysis(feature_matrix, target_col=args.target)
     print(f"      IRF computed for {len(irf)} features")
 
     # ── 5. Shock Analysis ─────────────────────────────────────────
-    print(f"\n[5/8] Shock & event analysis...")
+    print(f"\n[5/9] Shock & event analysis...")
     shock = run_shock_analysis(feature_matrix, target_col=args.target)
     print(f"      Event study and SHAP computed for {len(shock)} features")
 
-    # ── 6. Threshold Analysis ─────────────────────────────────────
-    print(f"\n[6/8] Threshold (indicator-function) analysis...")
+    # ── 6. Named-Event Impact ─────────────────────────────────────
+    print(f"\n[6/9] Named-event impact analysis (impacts.txt)...")
+    event_impact = run_event_impact(feature_matrix, target_col=args.target)
+    n_events = len(event_impact["events"])
+    n_matched = len(event_impact["equity_impact"])
+    print(f"      {n_matched}/{n_events} events matched in data; "
+          f"{len(event_impact['feature_score'])} features tracked")
+
+    # ── 7. Threshold Analysis ─────────────────────────────────────
+    print(f"\n[7/9] Threshold (indicator-function) analysis...")
     threshold = run_threshold_analysis(feature_matrix, target_col=args.target)
     n_triggers = int((threshold["trigger_score"] > 0.55).sum())
     print(f"      {n_triggers}/{len(threshold)} features show strong threshold trigger (score>0.55)")
 
-    # ── 7. Feature Selection ──────────────────────────────────────
-    print(f"\n[7/8] Feature selection (MI, Boruta, Regime)...")
+    # ── 8. Feature Selection ──────────────────────────────────────
+    print(f"\n[8/9] Feature selection (MI, Boruta, Regime)...")
     fs = run_feature_selection(feature_matrix, target_col=args.target)
     n_accepted = len(fs["boruta"].get("accepted", []))
     print(f"      Boruta accepted {n_accepted} features")
 
-    # ── 8. Relation Scoring ───────────────────────────────────────
-    print(f"\n[8/8] Computing relation scores...")
+    # ── 9. Relation Scoring ───────────────────────────────────────
+    print(f"\n[9/9] Computing relation scores...")
     scores = compute_relation_scores(continuous, irf, shock, threshold, fs)
     print(f"      Scored {len(scores)} features, top score: {scores['final_score'].max():.4f}")
 
@@ -119,6 +129,12 @@ def main():
     generate_report(
         scores,
         fs,
+        target_col=args.target,
+        top_n=args.top,
+        save=not args.no_save,
+    )
+    generate_event_impact_report(
+        event_impact,
         target_col=args.target,
         top_n=args.top,
         save=not args.no_save,

@@ -101,6 +101,7 @@ def make_stationary(series: pd.Series, method: str = "log_return") -> pd.Series:
 
 
 def build_feature_matrix(
+    target: str,
     indicators: dict[str, pd.DataFrame],
     equity: pd.DataFrame,
     frequency: str = 'w',
@@ -115,7 +116,7 @@ def build_feature_matrix(
     Returns a DataFrame with equity 'price' and 'eps' as last two columns.
     """
     eq = equity.copy()
-    eq = eq.resample('w').last()
+    eq = eq.resample(frequency).last()
     target_index = eq.index
     frames: list[pd.Series] = []
 
@@ -161,12 +162,11 @@ def build_feature_matrix(
 
     # Attach target columns
     if stationary:
-        eq["price"] = make_stationary(eq["price"], 'pct_change')
-        eq["eps"] = make_stationary(eq["eps"], 'pct_change')
+        eq["target"] = make_stationary(eq[target], 'pct_change')
 
-    result = pd.concat([feature_df, eq[["price", "eps"]]], axis=1)
+    result = pd.concat([feature_df, eq[["target", target]]], axis=1)
     # Drop rows where all features are NaN
-    feat_cols = [c for c in result.columns if c not in ("price", "eps")]
+    feat_cols = [c for c in result.columns if c not in ("target", target)]
     result = result.dropna(subset=feat_cols, how="all")
     result = result.dropna(subset=["price"])
     return result

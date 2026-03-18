@@ -301,8 +301,8 @@ def run_threshold_analysis(
     if horizons is None:
         horizons = [1, 3, 5, 10]
 
-    feat_cols = [c for c in feature_matrix.columns if c not in ("price", "eps")]
-    target = feature_matrix[target_col].dropna()
+    feat_cols = [c for c in feature_matrix.columns if c not in ("target", target_col)]
+    target = feature_matrix["target"].dropna()
 
     rows = []
     for col in feat_cols:

@@ -191,6 +191,134 @@ def generate_report(
 
 
 # --------------------------------------------------------------------------- #
+# Named-Event Impact Report
+# --------------------------------------------------------------------------- #
+
+def generate_event_impact_report(
+    event_impact: dict,
+    target_col: str = "price",
+    top_n: int = 10,
+    save: bool = True,
+) -> None:
+    """
+    Print and save the named-event impact report.
+
+    Parameters
+    ----------
+    event_impact : output of run_event_impact()
+    target_col   : 'price' or 'eps'
+    top_n        : number of top indicators to show per event
+    save         : whether to save Excel output
+    """
+    eq_impact   = event_impact.get("equity_impact",      pd.DataFrame())
+    eq_summary  = event_impact.get("equity_summary",     pd.DataFrame())
+    ind_summary = event_impact.get("indicator_summary",  pd.DataFrame())
+    feat_score  = event_impact.get("feature_score",      pd.Series(dtype=float))
+
+    if eq_impact.empty:
+        print("\n[Event Impact] No events matched in the data range.")
+        return
+
+    windows = [1, 2, 4, 8]
+    ret_cols = [f"ret_+{w}w" for w in windows if f"ret_+{w}w" in eq_impact.columns]
+    ar_cols  = [f"ar_+{w}w"  for w in windows if f"ar_+{w}w"  in eq_impact.columns]
+
+    # ------------------------------------------------------------------ #
+    # Console: Equity response per event
+    # ------------------------------------------------------------------ #
+    print()
+    print("=" * 90)
+    print(f"  Named-Event Impact Report | Target: {target_col.upper()}")
+    print("=" * 90)
+
+    # Header
+    w_labels = "  ".join(f"+{w}w".rjust(7) for w in windows if f"ret_+{w}w" in eq_impact.columns)
+    print(f"\n{'Event':<25} {'Date':<12} {'EvtVal':>10}  {w_labels}  (% ret from event)")
+    print("-" * 90)
+
+    for _, row in eq_impact.sort_values("event_date").iterrows():
+        rets = "  ".join(
+            f"{row[c]*100:>+6.1f}%" if not pd.isna(row.get(c)) else "   n/a "
+            for c in ret_cols
+        )
+        print(f"{row['event_name']:<25} {str(row['matched_date'].date()):<12} "
+              f"{row['event_value']:>10.1f}  {rets}")
+
+    # Summary for recurring events
+    recurring = eq_summary[eq_summary["n_occurrences"] > 1] if not eq_summary.empty else pd.DataFrame()
+    if not recurring.empty:
+        print(f"\n--- Recurring Event Averages ---")
+        print(f"{'Event':<25} {'N':>3}  {w_labels}  (mean % ret)")
+        print("-" * 70)
+        for _, row in recurring.iterrows():
+            rets = "  ".join(
+                f"{row[c]*100:>+6.1f}%" if not pd.isna(row.get(c)) else "   n/a "
+                for c in ret_cols
+            )
+            print(f"{row['event_name']:<25} {int(row['n_occurrences']):>3}  {rets}")
+
+    # ------------------------------------------------------------------ #
+    # Console: Top indicator reactions per event
+    # ------------------------------------------------------------------ #
+    if not ind_summary.empty:
+        delta_cols = [f"delta_+{w}w" for w in windows if f"delta_+{w}w" in ind_summary.columns]
+        print(f"\n--- Top {top_n} Indicators Reacting to Each Event (mean |Δz-score|) ---")
+
+        for event_name, grp in ind_summary.groupby("event_name"):
+            top = grp.nlargest(top_n, "mean_abs_delta")
+            print(f"\n  {event_name}")
+            d_hdr = "  ".join(f"+{w}w".rjust(7) for w in windows if f"delta_+{w}w" in delta_cols)
+            print(f"  {'Indicator':<60} {d_hdr}  (Δz)")
+            print("  " + "-" * 90)
+            for _, r in top.iterrows():
+                sheet, ind = _format_feature_name(r["feature"])
+                deltas = "  ".join(
+                    f"{r[c]:>+6.2f} " if not pd.isna(r.get(c)) else "   n/a "
+                    for c in delta_cols
+                )
+                print(f"  {sheet[:15]}|{ind[:43]:<59} {deltas}")
+
+    # Overall most event-reactive features
+    if not feat_score.empty:
+        print(f"\n--- Top {top_n} Most Event-Reactive Features (across all events) ---")
+        for feat, score in feat_score.head(top_n).items():
+            sheet, ind = _format_feature_name(feat)
+            print(f"  {score:.3f}  {sheet} | {ind[:60]}")
+
+    print("=" * 90)
+
+    if not save:
+        return
+
+    # ------------------------------------------------------------------ #
+    # Save Excel
+    # ------------------------------------------------------------------ #
+    out_dir   = _ensure_output_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    xlsx_path = out_dir / f"mfmea_event_impact_{target_col}_{timestamp}.xlsx"
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        # Per-occurrence equity response
+        eq_impact.to_excel(writer, sheet_name="Equity_Impact", index=False)
+
+        # Per-event-name equity summary
+        if not eq_summary.empty:
+            eq_summary.to_excel(writer, sheet_name="Equity_Summary", index=False)
+
+        # Per-event × feature indicator response summary
+        if not ind_summary.empty:
+            ind_summary.to_excel(writer, sheet_name="Indicator_Response", index=False)
+
+        # Overall feature event-reactiveness ranking
+        if not feat_score.empty:
+            feat_score.reset_index().rename(
+                columns={"index": "feature", 0: "event_reactiveness"}
+            ).to_excel(writer, sheet_name="Feature_Event_Scores", index=False)
+
+    print(f"\nEvent Impact Excel saved: {xlsx_path}")
+
+
+# --------------------------------------------------------------------------- #
 # Temporal Comparison Report
 # --------------------------------------------------------------------------- #
 

@@ -206,9 +206,9 @@ def run_feature_selection(
       boruta            : dict (accepted/tentative/rejected)
       regime_importance : pd.DataFrame
     """
-    feat_cols = [c for c in feature_matrix.columns if c not in ("price", "eps")]
+    feat_cols = [c for c in feature_matrix.columns if c not in ("target", target_col)]
     features = feature_matrix[feat_cols].fillna(0)
-    target = feature_matrix[target_col].dropna()
+    target = feature_matrix["target"].dropna()
 
     mi = mutual_information_scores(features, target)
     te = transfer_entropy_scores(features, target)

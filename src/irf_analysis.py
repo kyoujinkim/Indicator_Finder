@@ -74,8 +74,8 @@ def run_irf_analysis(
     Returns a summary DataFrame with columns:
       irf_persistence, event_aar, event_car, event_n, shap_value
     """
-    feat_cols = [c for c in feature_matrix.columns if c not in ("price", "eps")]
-    target = feature_matrix[target_col].dropna()
+    feat_cols = [c for c in feature_matrix.columns if c not in ("target", target_col)]
+    target = feature_matrix["target"].dropna()
 
     rows = []
     for col in feat_cols:
