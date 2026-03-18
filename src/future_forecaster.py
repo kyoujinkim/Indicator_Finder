@@ -267,6 +267,10 @@ def fit_base_model(
     coefs = dict(zip(available, model.coef_))
     nonzero = {f: c for f, c in coefs.items() if abs(c) > 1e-6}
 
+    # In-sample residual std — basis for prediction interval width
+    y_pred = model.predict(X_scaled)
+    residual_std = float(np.std(y - y_pred))
+
     return {
         "model": model,
         "scaler": scaler,
@@ -277,6 +281,7 @@ def fit_base_model(
         "trailing_feat_std": trailing_feat_std,
         "trailing_std": float(np.std(y)),
         "trailing_mean_y": float(np.mean(y[-8:])),  # recent 8-week mean return
+        "residual_std": residual_std,
     }
 
 
@@ -387,6 +392,7 @@ def run_forecast(
     top_n: int = 10,
     feature_args: dict[str, int] | None = None,
     today: datetime | None = None,
+    ci_level: float = 0.95,
     verbose: bool = True,
 ) -> dict:
     """
@@ -407,16 +413,21 @@ def run_forecast(
         determines whether a positive outlook raises or lowers the forecast.
     today : datetime, optional
         Reference date for event decay (defaults to datetime.today()).
+    ci_level : float
+        Confidence level for prediction interval (default 0.95 = 95%).
+        Interval width = z * residual_std * sqrt(n_weeks), where residual_std
+        is the in-sample ElasticNet residual std and n_weeks is the horizon.
     verbose : bool
         Print progress.
 
     Returns
     -------
     dict with keys:
-        'forecast'      : pd.DataFrame
+        'forecast'      : pd.DataFrame  (includes ci_lower/ci_upper/proj_lower/proj_upper)
         'base_model'    : dict
         'events_used'   : list[dict]
         'feature_args'  : dict[str, int]
+        'ci_level'      : float
         'windows'       : list[str]
     """
     if today is None:
@@ -457,17 +468,30 @@ def run_forecast(
                   f"decay={e['decay_weight']:.3f})")
 
     # ── Combine & build output table ─────────────────────────────────────────
+    from scipy.stats import norm as _norm
+    z = float(_norm.ppf((1 + ci_level) / 2))
+    residual_std = model_artifacts["residual_std"]
+
     target_series = feature_matrix["target"].dropna().iloc[-BASELINE_WINDOW:]
     target_series_std = float(target_series.std())
     current_price = float(feature_matrix[target].dropna().iloc[-1])
     records = []
     for window, days in WINDOWS.items():
+        n_weeks = days / 7.0
         base_ret = base_returns[window]
-        ev_adj = event_adj.get(window, 0.0) * target_series_std  # scale adjustment by target's trailing std
+        ev_adj = event_adj.get(window, 0.0) * target_series_std  # scale ar_ Z-scores to return units
         total_ret = base_ret + ev_adj
+
+        # CI: uncertainty widens with sqrt(horizon) — random-walk assumption
+        margin = z * residual_std * np.sqrt(n_weeks)
+        ci_lower = total_ret - margin
+        ci_upper = total_ret + margin
+
         direction = "UP" if total_ret > 0 else ("DOWN" if total_ret < 0 else "FLAT")
         magnitude = abs(total_ret)
-        projected = current_price * (1 + total_ret) if target == "price" else current_price + total_ret * current_price
+
+        def _proj(r: float) -> float:
+            return round(current_price * (1 + r), 2)
 
         records.append({
             "window": window,
@@ -477,7 +501,11 @@ def run_forecast(
             "total_return": round(total_ret, 6),
             "direction": direction,
             "magnitude_%": round(magnitude * 100, 4),
-            "projected_value": round(projected, 2),
+            "projected_value": _proj(total_ret),
+            "ci_lower": round(ci_lower, 6),
+            "ci_upper": round(ci_upper, 6),
+            "proj_lower": _proj(ci_lower),
+            "proj_upper": _proj(ci_upper),
         })
 
     forecast_df = pd.DataFrame(records).set_index("window")
@@ -487,6 +515,7 @@ def run_forecast(
         "base_model": model_artifacts,
         "events_used": events_used,
         "feature_args": feature_args or {},
+        "ci_level": ci_level,
         "windows": list(WINDOWS.keys()),
         "current_value": current_price,
         "target": target,
@@ -509,24 +538,29 @@ def print_forecast_report(result: dict) -> None:
     feature_args: dict[str, int] = result.get("feature_args", {})
     events = result["events_used"]
 
-    print(f"\n{'=' * 65}")
-    print(f"  MFMEA - Future {target.upper()} Forecast")
-    print(f"  As of: {today.strftime('%Y-%m-%d')}  |  Current {target}: {current:,.2f}")
-    print(f"{'=' * 65}")
+    ci_level = result.get("ci_level", 0.95)
+    ci_pct = int(ci_level * 100)
 
-    print(f"\n  {'Window':<8} {'Horizon':>10} {'Base Ret':>10} {'Evt Adj':>10} "
-          f"{'Total Ret':>10} {'Dir':>6} {'|Mag|%':>8} {'Projected':>12}")
-    print(f"  {'-' * 78}")
+    print(f"\n{'=' * 85}")
+    print(f"  MFMEA - Future {target.upper()} Forecast")
+    print(f"  As of: {today.strftime('%Y-%m-%d')}  |  Current {target}: {current:,.2f}  |  CI: {ci_pct}%")
+    print(f"{'=' * 85}")
+
+    print(f"\n  {'Window':<6} {'Horizon':>8} {'Base':>9} {'EvtAdj':>9} "
+          f"{'Total':>9} {'Dir':>5} {'Projected':>12} "
+          f"{'Lower':>12} {'Upper':>12}  ({ci_pct}% CI)")
+    print(f"  {'-' * 95}")
 
     for window, row in result["forecast"].iterrows():
         print(
-            f"  {window:<8} {row['horizon_days']:>8}d  "
-            f"{row['base_return']:>+10.4%} "
-            f"{row['event_adjustment']:>+10.4%} "
-            f"{row['total_return']:>+10.4%} "
-            f"{row['direction']:>6} "
-            f"{row['magnitude_%']:>7.3f}% "
-            f"{row['projected_value']:>12,.2f}"
+            f"  {window:<6} {row['horizon_days']:>6}d  "
+            f"{row['base_return']:>+9.3%} "
+            f"{row['event_adjustment']:>+9.3%} "
+            f"{row['total_return']:>+9.3%} "
+            f"{'UP' if row['direction']=='UP' else 'DN' if row['direction']=='DOWN' else '--':>5} "
+            f"{row['projected_value']:>12,.2f} "
+            f"{row['proj_lower']:>12,.2f} "
+            f"{row['proj_upper']:>12,.2f}"
         )
 
     if events:

@@ -59,8 +59,12 @@ def parse_args():
         help="Skip saving output Excel file",
     )
     parser.add_argument(
-        "--add_exp", action="store_true",
+        "--expect", action="store_true",
         help="Add expectation on features"
+    )
+    parser.add_argument(
+        "--ci", type=float, default=0.95, metavar="LEVEL",
+        help="Confidence interval level (default: 0.95 = 95%%)",
     )
     return parser.parse_args()
 
@@ -72,13 +76,13 @@ def _short_name(feature: str) -> str:
     return feature
 
 
-def prompt_feature_args(features: list[str], coefs: dict[str, float], add_exp: bool = False) -> dict[str, int]:
+def prompt_feature_args(features: list[str], coefs: dict[str, float], expect: bool = False) -> dict[str, int]:
     """
     Interactively ask the user to rate each base indicator.
     Shows the model's ElasticNet coefficient so the user understands the direction.
     Pressing Enter (empty input) skips → treated as 0 (neutral).
     """
-    if ~add_exp:
+    if not expect:
         feature_args = {feat: 0 for feat in features}
         return feature_args
 
@@ -146,7 +150,7 @@ def main():
     # Fit model first so we can show coefficient direction during prompting
     model_artifacts = fit_base_model(feature_matrix, args.target, base_features)
 
-    feature_args = prompt_feature_args(base_features, model_artifacts["coefs"], args.add_exp)
+    feature_args = prompt_feature_args(base_features, model_artifacts["coefs"], args.expect)
 
     # ── 4. Run forecast ───────────────────────────────────────────────────────
     print(f"[4/4] Running forecast (target={args.target})...")
@@ -156,6 +160,7 @@ def main():
         top_n=args.top,
         feature_args=feature_args,
         today=datetime.today(),
+        ci_level=args.ci,
         verbose=True,
     )
 
