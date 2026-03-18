@@ -4,23 +4,39 @@ Future Forecaster for MFMEA.
 Two-step forecast architecture (see readme_future_forecast.md):
 
   Step 1 - Base Trend Model
-    · Selects top indicators from report_{target} by final_score
-    · Filters duplicates/unstable via comparison_{target}
-    · Fits ElasticNet on historical stationary returns
-    · Extrapolates trend for each forecast window using EWMA projection
+    · Selects top-N indicators from report_{target} by final_score
+    · Excludes 'fallen' features via comparison_{target}
+    · Deduplicates by indicator name (highest score kept)
+    · Fits ElasticNetCV on historical stationary returns
+    · Per-feature EWMA (span=8w) represents current market state
+    · Optional qualitative assessment via --add_exp flag:
+        Each indicator can be rated -2..+2; the rating shifts its EWMA by
+        arg × std(feat) × 0.5 before prediction. The model's own coefficient
+        determines whether a positive rating raises or lowers the forecast.
+    · Weekly signal is accumulated linearly across forecast windows (1w..26w)
 
   Step 2 - Event Volatility Adjustment
-    · Parses data/impacts.txt for recent event dates
-    · Computes decay-weighted impact from event_impact_{target} (Equity_Summary)
-    · Activates only windows still within the event's influence horizon
-
-  Optional qualitative arg (-2 … +2) nudges the base forecast.
+    · Parses data/impacts.txt for named macro events and dates
+    · For each event, computes days_since = today - event_date
+    · _active_windows(): for each forecast slot (1w/2w/4w/13w/26w), maps to
+        the time-shifted ar_ lookup column using:
+            w1 = abs(-(days_since + n_weeks*7) // 7)
+        so the ar_ column reflects the remaining horizon from today rather
+        than from the original event date.
+    · Abnormal return (ar_+Xw, Z-score units) is fetched from Equity_Summary,
+        multiplied by exponential decay weight (half_life=14d), then scaled by
+        target_series_std (trailing BASELINE_WINDOW=12w) to convert to return units.
+    · Contributions are summed across all active events per window.
 
 Returns:
   dict with keys:
-    'forecast'   : pd.DataFrame - windows × {direction, magnitude, adjusted}
-    'base_model' : dict - coefs, features selected
-    'events_used': list - events that contributed to adjustment
+    'forecast'     : pd.DataFrame - windows x {base_return, event_adjustment,
+                                                total_return, direction,
+                                                magnitude_%, projected_value}
+    'base_model'   : dict - ElasticNet model, coefs, EWMA values, feature stds
+    'events_used'  : list[dict] - events that contributed with decay/contrib detail
+    'feature_args' : dict[str, int] - per-indicator qualitative ratings used
+    'windows'      : list[str]
 """
 
 import glob
