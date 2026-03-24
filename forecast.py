@@ -20,6 +20,8 @@ import argparse
 import time
 from datetime import datetime
 
+import pandas as pd
+
 from src.data_loader import load_indicators, load_equity
 from src.preprocessor import build_feature_matrix
 from src.future_forecaster import (
@@ -36,6 +38,7 @@ from src.config import HORIZON_DAMPENING, ARG_LABEL
 
 # String-keyed version of ARG_LABEL for CLI input() validation
 _RATING_LABELS = {str(k): v for k, v in ARG_LABEL.items()}
+_CACHE = {}
 
 
 def _short_name(feature: str) -> str:
@@ -66,6 +69,10 @@ def prompt_feature_args(
         direction = "+" if coefs.get(feat, 0.0) >= 0 else "-"
         short     = _short_name(feat)
         cur_val   = round(trail_ewma.get(feat, float("nan")), 4)
+        if short in _CACHE:
+            print(f"  [{direction}] {short}  (now: {cur_val}) -> {_CACHE[short]} (cached)")
+            feature_args[feat] = int(_CACHE[short])
+            continue
         while True:
             try:
                 raw = input(f"  [{direction}] {short}  (now: {cur_val}): ").strip()
@@ -77,6 +84,7 @@ def prompt_feature_args(
                 break
             if raw in _RATING_LABELS:
                 feature_args[feat] = int(raw)
+                _CACHE[short] = raw
                 break
             print("    Enter a value from -2 to 2 (or press Enter to skip).")
 
@@ -90,6 +98,10 @@ def prompt_feature_args(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MFMEA Future Forecaster")
+    parser.add_argument(
+        "--code", type=str, default="G0",
+        help="Which code to analyze (e.g. 'G10'); if not specified, analyze last features",
+    )
     parser.add_argument("--target", choices=["price", "eps"], default="price",
                         help="Forecast target (default: price)")
     parser.add_argument("--top",    type=int, default=10,
@@ -105,12 +117,12 @@ def parse_args():
                              "1.0=linear, 0.5=sqrt. Lower -> shorter long-horizon estimates.")
     parser.add_argument("--no-save", action="store_true",
                         help="Skip saving output Excel file")
+    parser.add_argument("--all", action="store_true",
+                         help="Analyze all codes in the equity list (overrides --code)")
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-
+def main(args):
     print("=" * 65)
     print("  MFMEA - Future Forecaster")
     print("=" * 65)
@@ -119,7 +131,7 @@ def main():
     # 1. Load raw data
     print("\n[1/3] Loading data...")
     indicators = load_indicators()
-    equity     = load_equity()
+    equity     = load_equity(args.target, args.code)
     print(f"      {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # 2. Build feature matrix
@@ -132,7 +144,7 @@ def main():
 
     # 3. Fit model (done once; reused inside run_forecast)
     print(f"\n[3/3] Running forecast (target={args.target})...")
-    model_artifacts, base_features = prepare_model(feature_matrix, args.target, args.top)
+    model_artifacts, base_features = prepare_model(feature_matrix, args.code, args.target, args.top)
     print(f"      {len(base_features)} base features selected, "
           f"{len(model_artifacts['nonzero_coefs'])} non-zero coefs")
 
@@ -145,6 +157,7 @@ def main():
 
     result = run_forecast(
         feature_matrix,
+        code            = args.code,
         target          = args.target,
         feature_args    = feature_args,
         model_artifacts = model_artifacts,   # skip re-fitting
@@ -158,7 +171,7 @@ def main():
     print_forecast_report(result)
 
     if not args.no_save:
-        path = save_forecast_report(result, save=True)
+        path = save_forecast_report(args.code, result, save=True)
         if path:
             print(f"  Saved -> {path}")
 
@@ -166,4 +179,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    if args.all:
+        equ_list = pd.read_excel("data/equity.xlsx", sheet_name="list", header=0)
+        length = 3
+        equ_list = equ_list[equ_list.Length <= length]
+        equs = equ_list["Code"].tolist()
+        print(f"Analyzing equities with length ≤ {length}: {equs}")
+        for code in equs:
+            args.code = code
+            print(f"\n{'#' * 60}")
+            print(f" Analyzing {code} (length={length})")
+            print(f"{'#' * 60}")
+            main(args)
+    else:
+        main(args)

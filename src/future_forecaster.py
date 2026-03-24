@@ -68,24 +68,24 @@ def _load_tabular(pattern_csv: str, pattern_xlsx: str, sheet: str = "Delta") -> 
         return pd.read_excel(_find_latest(pattern_xlsx), sheet_name=sheet)
 
 
-def load_report(target: str) -> pd.DataFrame:
+def load_report(code:str, target: str) -> pd.DataFrame:
     return _load_tabular(
-        f"mfmea_report_{target}_*.csv",
-        f"mfmea_report_{target}_*.xlsx",
+        f"mfmea_report_{code}_{target}_*.csv",
+        f"mfmea_report_{code}_{target}_*.xlsx",
         sheet="Full_Ranking",
     )
 
 
-def load_comparison(target: str) -> pd.DataFrame:
+def load_comparison(code: str, target: str) -> pd.DataFrame:
     return _load_tabular(
-        f"mfmea_comparison_{target}_*.csv",
-        f"mfmea_comparison_{target}_*.xlsx",
+        f"mfmea_comparison_{code}_{target}_*.csv",
+        f"mfmea_comparison_{code}_{target}_*.xlsx",
         sheet="Delta",
     )
 
 
-def _load_equity_summary(target: str) -> pd.DataFrame:
-    path = _find_latest(f"mfmea_event_impact_{target}_*.xlsx")
+def _load_equity_summary(code:str, target: str) -> pd.DataFrame:
+    path = _find_latest(f"mfmea_event_impact_{code}_{target}_*.xlsx")
     return pd.read_excel(path, sheet_name="Equity_Summary")
 
 
@@ -241,6 +241,7 @@ def fit_base_model(
 
 def prepare_model(
     feature_matrix: pd.DataFrame,
+    code: str,
     target: str,
     top_n: int = 10,
 ) -> tuple[dict, list[str]]:
@@ -251,8 +252,8 @@ def prepare_model(
     Call this before prompting the user so coefs are available for display,
     then pass the collected feature_args into run_forecast.
     """
-    report     = load_report(target)
-    comparison = load_comparison(target)
+    report     = load_report(code, target)
+    comparison = load_comparison(code, target)
     features   = select_base_features(report, comparison, top_n)
     artifacts  = fit_base_model(feature_matrix, target, features)
     return artifacts, features
@@ -356,6 +357,7 @@ def _event_adjustment(
 
 def run_forecast(
     feature_matrix: pd.DataFrame,
+    code: str,
     target: str,
     feature_args: dict[str, int] | None = None,
     model_artifacts: dict | None = None,
@@ -391,11 +393,11 @@ def run_forecast(
 
     if verbose:
         print("[Forecast] Loading output reports...")
-    equity_summary = _load_equity_summary(target)
+    equity_summary = _load_equity_summary(code, target)
 
     # Reuse pre-fitted model if supplied (avoids redundant refitting)
     if model_artifacts is None:
-        report, comparison = load_report(target), load_comparison(target)
+        report, comparison = load_report(code, target), load_comparison(code, target)
         base_features      = select_base_features(report, comparison, top_n)
         if verbose:
             print(f"[Forecast] Base features selected ({len(base_features)}): "
@@ -521,7 +523,7 @@ def print_forecast_report(result: dict) -> None:
     print(f"{'=' * 85}\n")
 
 
-def save_forecast_report(result: dict, save: bool = True) -> Path | None:
+def save_forecast_report(code: str, result: dict, save: bool = True) -> Path | None:
     if not save:
         return None
 
@@ -530,7 +532,7 @@ def save_forecast_report(result: dict, save: bool = True) -> Path | None:
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     target = result["target"]
-    path   = OUTPUT_DIR / f"mfmea_forecast_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
+    path   = OUTPUT_DIR / f"mfmea_forecast_{code}_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
     wb     = Workbook()
 
     # Sheet 1: Forecast
