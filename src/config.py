@@ -13,7 +13,8 @@ from pathlib import Path
 
 BASE_DIR    = Path(__file__).parent.parent
 DATA_DIR    = BASE_DIR / "data"
-OUTPUT_DIR  = BASE_DIR / "output"
+OUTPUT_DIR  = BASE_DIR / "output/mfmea"
+FORECAST_DIR = BASE_DIR / "output/forecast"
 
 DATA_XLSX    = DATA_DIR / "data.xlsx"
 EQUITY_XLSX  = DATA_DIR / "equity.xlsx"

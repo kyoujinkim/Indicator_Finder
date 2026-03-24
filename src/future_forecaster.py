@@ -38,7 +38,7 @@ from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 
 from .config import (
-    OUTPUT_DIR, DATA_DIR, IMPACTS_FILE,
+    OUTPUT_DIR, DATA_DIR, FORECAST_DIR, IMPACTS_FILE,
     FORECAST_WINDOWS as WINDOWS,
     WINDOW_TO_AR_COL as _WINDOW_TO_AR_COL,
     EWMA_SPAN,
@@ -532,7 +532,7 @@ def save_forecast_report(code: str, result: dict, save: bool = True) -> Path | N
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     target = result["target"]
-    path   = OUTPUT_DIR / f"mfmea_forecast_{code}_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
+    path   = FORECAST_DIR / f"mfmea_forecast_{code}_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
     wb     = Workbook()
 
     # Sheet 1: Forecast
