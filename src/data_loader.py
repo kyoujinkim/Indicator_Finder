@@ -18,12 +18,9 @@ import pandas as pd
 import re
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent.parent / "data"
-DATA_XLSX = DATA_DIR / "data.xlsx"
-EQUITY_XLSX = DATA_DIR / "equity.xlsx"
+from .config import DATA_DIR, DATA_XLSX, EQUITY_XLSX, DATA_START_ROW
 
-# Row index where actual data begins (0-based)
-_DATA_START_ROW = 15  # index 15 = Row 16
+_DATA_START_ROW = DATA_START_ROW  # alias kept for internal use
 
 
 def _parse_frequency(sheet_name: str) -> str:
@@ -81,31 +78,26 @@ def load_indicators() -> dict[str, pd.DataFrame]:
     return result
 
 
-def load_equity() -> pd.DataFrame:
+def load_equity(target, code) -> pd.DataFrame:
     """
     Returns a DataFrame with columns ['price', 'eps'] indexed by date.
     """
-    raw = pd.read_excel(EQUITY_XLSX, sheet_name="equity", header=None)
+    raw = pd.read_excel(EQUITY_XLSX, sheet_name=target, header=None)
 
     # Row 14 (index 14) contains the column labels
-    col_row = raw.iloc[14].tolist()
+    col_row = raw.iloc[0].tolist()
     data = raw.iloc[_DATA_START_ROW:].copy()
     data.columns = col_row
 
-    date_col = col_row[0]
-    data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
-    data = data.dropna(subset=[date_col])
+    date_col_name = col_row[0]
+    date_col = pd.to_datetime(data[date_col_name], errors="coerce")
+
+    data = data[[code]]
+
     data = data.set_index(date_col).sort_index()
-    data = data.apply(pd.to_numeric, errors="coerce")
+    data = data.apply(pd.to_numeric, errors="coerce").dropna()
 
     # Rename to standard names
-    cols = [c for c in data.columns if c is not None and str(c).lower() != "nan"]
-    rename_map = {}
-    for i, c in enumerate(cols):
-        if i == 0:
-            rename_map[c] = "price"
-        elif i == 1:
-            rename_map[c] = "eps"
-    data = data.rename(columns=rename_map)[["price", "eps"]]
+    data.columns = [target]
 
     return data

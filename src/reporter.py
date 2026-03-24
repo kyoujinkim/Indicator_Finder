@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
+from .config import OUTPUT_DIR, SCORE_COLS as _SCORE_COLS_CFG
 
 
 def _ensure_output_dir() -> Path:
@@ -47,6 +47,7 @@ def _format_feature_name(col: str) -> tuple[str, str]:
 def generate_report(
     scores: pd.DataFrame,
     fs_results: dict,
+    code: str = "",
     target_col: str = "price",
     top_n: int = 20,
     save: bool = True,
@@ -143,14 +144,14 @@ def generate_report(
     # ------------------------------------------------------------------ #
     # Save CSV
     # ------------------------------------------------------------------ #
-    csv_path = out_dir / f"mfmea_report_{target_col}_{timestamp}.csv"
+    csv_path = out_dir / f"mfmea_report_{code}_{target_col}_{timestamp}.csv"
     scores.to_csv(csv_path)
     print(f"\nCSV saved: {csv_path}")
 
     # ------------------------------------------------------------------ #
     # Save Excel (multi-sheet)
     # ------------------------------------------------------------------ #
-    xlsx_path = out_dir / f"mfmea_report_{target_col}_{timestamp}.xlsx"
+    xlsx_path = out_dir / f"mfmea_report_{code}_{target_col}_{timestamp}.xlsx"
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         # Full ranking
         scores.to_excel(writer, sheet_name="Full_Ranking")
@@ -196,6 +197,7 @@ def generate_report(
 
 def generate_event_impact_report(
     event_impact: dict,
+    code: str = "",
     target_col: str = "price",
     top_n: int = 10,
     save: bool = True,
@@ -295,7 +297,7 @@ def generate_event_impact_report(
     # ------------------------------------------------------------------ #
     out_dir   = _ensure_output_dir()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    xlsx_path = out_dir / f"mfmea_event_impact_{target_col}_{timestamp}.xlsx"
+    xlsx_path = out_dir / f"mfmea_event_impact_{code}_{target_col}_{timestamp}.xlsx"
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         # Per-occurrence equity response
@@ -323,14 +325,12 @@ def generate_event_impact_report(
 # --------------------------------------------------------------------------- #
 
 _STATUS_ARROW = {"risen": "↑", "fallen": "↓", "stable": "=", "new": "NEW", "dropped": "DEL"}
-_SCORE_COLS = [
-    "rank", "final_score",
-    "continuous_score", "irf_score", "shock_score", "threshold_score",
-]
+_SCORE_COLS = _SCORE_COLS_CFG
 
 
 def generate_comparison_report(
     comparison: dict,
+    code: str = "",
     target_col: str = "price",
     top_n: int = 20,
     save: bool = True,
@@ -441,11 +441,11 @@ def generate_comparison_report(
     # ------------------------------------------------------------------ #
     # Save
     # ------------------------------------------------------------------ #
-    csv_path = out_dir / f"mfmea_comparison_{target_col}_{timestamp}.csv"
+    csv_path = out_dir / f"mfmea_comparison_{code}_{target_col}_{timestamp}.csv"
     delta.to_csv(csv_path, index=False)
     print(f"\nComparison CSV saved: {csv_path}")
 
-    xlsx_path = out_dir / f"mfmea_comparison_{target_col}_{timestamp}.xlsx"
+    xlsx_path = out_dir / f"mfmea_comparison_{code}_{target_col}_{timestamp}.xlsx"
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         delta.to_excel(writer, sheet_name="Delta", index=False)
 

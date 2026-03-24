@@ -28,16 +28,7 @@ from .shock_analysis import run_shock_analysis
 from .threshold_analysis import run_threshold_analysis
 from .feature_selector import run_feature_selection
 from .relation_scorer import compute_relation_scores
-
-
-# --------------------------------------------------------------------------- #
-# Pipeline runner for a single window
-# --------------------------------------------------------------------------- #
-
-_SCORE_COLS = [
-    "rank", "final_score",
-    "continuous_score", "irf_score", "shock_score", "threshold_score",
-]
+from .config import SCORE_COLS as _SCORE_COLS
 
 def run_pipeline(
     feature_matrix: pd.DataFrame,

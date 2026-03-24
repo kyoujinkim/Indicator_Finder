@@ -16,12 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-IMPACTS_FILE = Path(__file__).parent.parent / "data" / "impacts.txt"
-
-# Post-event windows to track (weeks)
-RESPONSE_WINDOWS = [1, 2, 4, 8]
-# Pre-event baseline length for abnormal-return calc
-BASELINE_WINDOW = 12  # weeks
+from .config import IMPACTS_FILE, RESPONSE_WINDOWS, BASELINE_WINDOW
 
 
 # --------------------------------------------------------------------------- #

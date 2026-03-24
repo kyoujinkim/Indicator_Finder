@@ -21,6 +21,8 @@ Scoring formula (normalized 0-1 per metric, then weighted sum):
 import numpy as np
 import pandas as pd
 
+from .config import PATH_WEIGHTS, BORUTA_BONUS, METRIC_WEIGHTS
+
 
 def _normalize(s: pd.Series) -> pd.Series:
     """Min-max normalize to [0, 1]."""
@@ -36,8 +38,8 @@ def compute_relation_scores(
     shock_summary: pd.DataFrame,
     threshold_summary: pd.DataFrame,
     fs_results: dict,
-    path_weights: tuple[float, float, float, float] = (0.40, 0.10, 0.20, 0.30),
-    boruta_bonus: float = 0.15,
+    path_weights: tuple[float, float, float, float] = PATH_WEIGHTS,
+    boruta_bonus: float = BORUTA_BONUS,
     weights: dict | None = None,
 ) -> pd.DataFrame:
     """
@@ -62,21 +64,7 @@ def compute_relation_scores(
     w_cont, w_irf, w_shock, w_thresh = path_weights
 
     if weights is None:
-        weights = {
-            # Continuous
-            "granger": 0.35,
-            "transfer_entropy": 0.35,
-            "elasticnet": 0.30,
-            # Irf
-            "irf": 1.0,
-            # Shock
-            "event": 0.50,
-            "shap": 0.50,
-            # Threshold
-            "regime_diff": 0.40,
-            "trigger_score": 0.40,
-            "asymmetry": 0.20,
-        }
+        weights = METRIC_WEIGHTS
 
     # ---------- Continuous ----------
     cont = continuous_summary.copy()

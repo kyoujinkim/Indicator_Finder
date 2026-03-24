@@ -24,6 +24,8 @@ Usage:
 import argparse
 import time
 
+import pandas as pd
+
 from src.data_loader import load_indicators, load_equity
 from src.preprocessor import build_feature_matrix
 from src.continuous_analysis import run_continuous_analysis
@@ -39,6 +41,10 @@ from src.temporal_comparison import compare_periods
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MFMEA - Macro-Equity Analytics")
+    parser.add_argument(
+        "--code", type=str, default="G0",
+        help="Which code to analyze (e.g. 'G10'); if not specified, analyze last features",
+    )
     parser.add_argument("--target", choices=["price", "eps"], default="price")
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--align", choices=["step_fill", "midas"], default="step_fill")
@@ -56,12 +62,14 @@ def parse_args():
         "--shift", type=int, default=4,
         help="Weeks to shift back for the past window (default: 4 ≈ 1 month)",
     )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Analyze all codes in the equity list (overrides --code)"
+    )
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-
+def main(args):
     print("=" * 60)
     print(" MFMEA - Multi-Frequency Macro-Equity Analytics")
     print("=" * 60)
@@ -70,7 +78,7 @@ def main():
     t0 = time.time()
     print("\n[1/9] Loading data...")
     indicators = load_indicators()
-    equity = load_equity()
+    equity = load_equity(args.target, args.code)
     print(f"      Loaded {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # ── 2. Preprocess ─────────────────────────────────────────────
@@ -129,12 +137,14 @@ def main():
     generate_report(
         scores,
         fs,
+        code=args.code,
         target_col=args.target,
         top_n=args.top,
         save=not args.no_save,
     )
     generate_event_impact_report(
         event_impact,
+        code=args.code,
         target_col=args.target,
         top_n=args.top,
         save=not args.no_save,
@@ -155,6 +165,7 @@ def main():
         print()
         generate_comparison_report(
             comparison,
+            code=args.code,
             target_col=args.target,
             top_n=args.top,
             save=not args.no_save,
@@ -165,4 +176,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    if args.all:
+        equ_list = pd.read_excel("data/equity.xlsx", sheet_name="list", header=0)
+        length = 3
+        equ_list = equ_list[equ_list.Length <= length]
+        equs = equ_list["Code"].tolist()
+        print(f"Analyzing equities with length ≤ {length}: {equs}")
+        for code in equs:
+            args.code = code
+            print(f"\n{'#' * 60}")
+            print(f" Analyzing {code} (length={length})")
+            print(f"{'#' * 60}")
+            main(args)
+    else:
+        main(args)

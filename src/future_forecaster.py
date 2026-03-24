@@ -37,37 +37,16 @@ from scipy.stats import norm as _norm
 from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Paths & constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
-DATA_DIR   = Path(__file__).parent.parent / "data"
-
-# Forecast horizons: label -> calendar days
-WINDOWS: dict[str, int] = {
-    "1w":   7,
-    "2w":  14,
-    "4w":  28,
-    "13w": 91,
-    "26w": 182,
-}
-
-# Maps each forecast slot to the ar_ column in Equity_Summary
-# _active_windows returns the effective lookup window per slot after time-shifting
-_WINDOW_TO_AR_COL: dict[str, str] = {
-    "1w":  "ar_+1w",
-    "2w":  "ar_+2w",
-    "4w":  "ar_+4w",
-    "13w": "ar_+8w",
-    "26w": "ar_+8w",
-}
-
-_ARG_SCALE        = 0.5   # EWMA nudge per qualitative unit = 0.5 × feature std
-HORIZON_DAMPENING = 0.6   # γ: base_return = weekly_signal × n_weeks^γ
-BASELINE_WINDOW   = 12    # weeks of trailing target history for scaling event ar_
-
-_ARG_LABEL = {-2: "very bad", -1: "bad", 0: "neutral", 1: "good", 2: "very good"}
+from .config import (
+    OUTPUT_DIR, DATA_DIR, IMPACTS_FILE,
+    FORECAST_WINDOWS as WINDOWS,
+    WINDOW_TO_AR_COL as _WINDOW_TO_AR_COL,
+    EWMA_SPAN,
+    ARG_SCALE as _ARG_SCALE,
+    HORIZON_DAMPENING,
+    BASELINE_WINDOW,
+    ARG_LABEL as _ARG_LABEL,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,7 +92,7 @@ def _load_equity_summary(target: str) -> pd.DataFrame:
 def _load_events() -> pd.DataFrame:
     """Parse data/impacts.txt -> DataFrame[event_name, event_date, probability]."""
     rows = []
-    with open(DATA_DIR / "impacts.txt", encoding="utf-8") as f:
+    with open(IMPACTS_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -233,9 +212,8 @@ def fit_base_model(
     )
     model.fit(X_scaled, y)
 
-    ewma_span = 8
     trailing_ewma = {
-        f: float(feature_matrix[f].ewm(span=ewma_span).mean().iloc[-1])
+        f: float(feature_matrix[f].ewm(span=EWMA_SPAN).mean().iloc[-1])
         for f in available
     }
     trailing_feat_std = {

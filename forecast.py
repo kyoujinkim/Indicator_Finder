@@ -27,14 +27,15 @@ from src.future_forecaster import (
     run_forecast,
     print_forecast_report,
     save_forecast_report,
-    HORIZON_DAMPENING,
 )
+from src.config import HORIZON_DAMPENING, ARG_LABEL
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Interactive prompt helpers (CLI only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_RATING_LABELS = {"-2": "very bad", "-1": "bad", "0": "neutral", "1": "good", "2": "very good"}
+# String-keyed version of ARG_LABEL for CLI input() validation
+_RATING_LABELS = {str(k): v for k, v in ARG_LABEL.items()}
 
 
 def _short_name(feature: str) -> str:
