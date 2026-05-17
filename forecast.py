@@ -18,9 +18,10 @@ Usage:
 
 import argparse
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 from src.data_loader import load_indicators, load_equity
 from src.preprocessor import build_feature_matrix
@@ -30,14 +31,12 @@ from src.future_forecaster import (
     print_forecast_report,
     save_forecast_report,
 )
-from src.config import HORIZON_DAMPENING, ARG_LABEL
+from src.config import HORIZON_DAMPENING
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Interactive prompt helpers (CLI only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# String-keyed version of ARG_LABEL for CLI input() validation
-_RATING_LABELS = {str(k): v for k, v in ARG_LABEL.items()}
 _CACHE = {}
 
 
@@ -49,7 +48,7 @@ def _short_name(feature: str) -> str:
 def prompt_feature_args(
     model_artifacts: dict,
     features: list[str],
-) -> dict[str, int]:
+) -> dict[str, float]:
     """
     Interactively rate each base indicator (-2..+2).
     Shows direction sign from ElasticNet coef and current EWMA value.
@@ -60,33 +59,38 @@ def prompt_feature_args(
 
     print("\n" + "=" * 65)
     print("  Qualitative Indicator Assessment")
-    print("  -2 very bad  |  -1 bad  |  0 neutral  |  +1 good  |  +2 very good")
+    print("  -2 Deep Decline  |  -1 Decline  |  0 Neutral  |  +1 Increse  |  +2 Sharp Increase")
     print("  (Press Enter to skip = neutral)")
     print("=" * 65)
 
-    feature_args: dict[str, int] = {}
+    feature_args: dict[str, float] = {}
     for feat in features:
+        if coefs.get(feat, 0.0) == 0.0:
+            feature_args[feat] = 0
+            continue
         direction = "+" if coefs.get(feat, 0.0) >= 0 else "-"
         short     = _short_name(feat)
+        history   = model_artifacts['trailing_history'].get(feat)
         cur_val   = round(trail_ewma.get(feat, float("nan")), 4)
+        std_val   = round(model_artifacts["trailing_feat_std"].get(feat, float("nan")), 4)
         if short in _CACHE:
-            print(f"  [{direction}] {short}  (now: {cur_val}) -> {_CACHE[short]} (cached)")
-            feature_args[feat] = int(_CACHE[short])
+            print(f"  [{direction}] {short}  (current: {cur_val}, std: {std_val}) -> {_CACHE[short]} (cached)")
+            feature_args[feat] = float(_CACHE[short])
             continue
         while True:
             try:
-                raw = input(f"  [{direction}] {short}  (now: {cur_val}): ").strip()
+                print("History: ", history.index.strftime('%Y%m%d').tolist(), history.values)
+                raw = input(f"  [{direction}] {short}  (current: {cur_val}, std: {std_val}): ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n  (Interrupted — remaining set to neutral)")
                 return feature_args
             if raw == "":
                 feature_args[feat] = 0
+                _CACHE[short] = 0
                 break
-            if raw in _RATING_LABELS:
-                feature_args[feat] = int(raw)
-                _CACHE[short] = raw
-                break
-            print("    Enter a value from -2 to 2 (or press Enter to skip).")
+            feature_args[feat] = float(raw)
+            _CACHE[short] = raw
+            break
 
     print()
     return feature_args
@@ -102,13 +106,13 @@ def parse_args():
         "--code", type=str, default="G0",
         help="Which code to analyze (e.g. 'G10'); if not specified, analyze last features",
     )
-    parser.add_argument("--target", choices=["price", "eps"], default="price",
+    parser.add_argument("--target", choices=["price", "eps"], default="eps",
                         help="Forecast target (default: price)")
     parser.add_argument("--top",    type=int, default=10,
                         help="Number of top base indicators (default: 10)")
     parser.add_argument("--align",  choices=["step_fill", "midas"], default="step_fill",
                         help="Frequency alignment method (default: step_fill)")
-    parser.add_argument("--expect", action="store_true",
+    parser.add_argument("--expect", action="store_true", default=True,
                         help="Prompt for per-indicator qualitative ratings")
     parser.add_argument("--ci",     type=float, default=0.95, metavar="LEVEL",
                         help="Confidence interval level (default: 0.95)")
@@ -119,6 +123,8 @@ def parse_args():
                         help="Skip saving output Excel file")
     parser.add_argument("--all", action="store_true",
                          help="Analyze all codes in the equity list (overrides --code)")
+    parser.add_argument("--date", action="store", type=str, default=None,)
+    parser.add_argument("--s_len", action="store", type=int, default=3, help="Minimum length of sector code to analyze (default: 5)")
     return parser.parse_args()
 
 
@@ -130,8 +136,11 @@ def main(args):
 
     # 1. Load raw data
     print("\n[1/3] Loading data...")
-    indicators = load_indicators()
-    equity     = load_equity(args.target, args.code)
+    indicators = load_indicators(args.date)
+    equity     = load_equity(args.target, args.code, args.date)
+    if len(equity.loc[pd.to_datetime(args.date)-relativedelta(years=1):args.date]) < 40:
+        print(f"      Loaded {len(equity)} equity rows. Since there is not enough data, skip analysis.")
+        return False
     print(f"      {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # 2. Build feature matrix
@@ -162,7 +171,7 @@ def main(args):
         feature_args    = feature_args,
         model_artifacts = model_artifacts,   # skip re-fitting
         top_n           = args.top,
-        today           = datetime.today(),
+        today           = args.date,
         ci_level        = args.ci,
         horizon_damp    = args.damp,
         verbose         = True,
@@ -180,17 +189,20 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.date == None:
+        args.date = date.today().strftime("%Y-%m-%d")
 
     if args.all:
         equ_list = pd.read_excel("data/equity.xlsx", sheet_name="list", header=0)
-        length = 3
-        equ_list = equ_list[equ_list.Length <= length]
+        start_length = args.s_len - 2
+        total_length = args.s_len
+        equ_list = equ_list[(start_length < equ_list.Length) & (equ_list.Length <= total_length)]
         equs = equ_list["Code"].tolist()
-        print(f"Analyzing equities with length ≤ {length}: {equs}")
+        print(f"Analyzing equities with length ≤ {total_length}: {equs}")
         for code in equs:
             args.code = code
             print(f"\n{'#' * 60}")
-            print(f" Analyzing {code} (length={length})")
+            print(f" Analyzing {code} (length={total_length})")
             print(f"{'#' * 60}")
             main(args)
     else:

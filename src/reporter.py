@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from .config import OUTPUT_DIR, SCORE_COLS as _SCORE_COLS_CFG
+from .config import OUTPUT_DIR, SCORE_COLS as _SCORE_COLS_CFG, RESPONSE_WINDOWS
 
 
 def _ensure_output_dir() -> Path:
@@ -221,7 +221,7 @@ def generate_event_impact_report(
         print("\n[Event Impact] No events matched in the data range.")
         return
 
-    windows = [1, 2, 4, 8]
+    windows = RESPONSE_WINDOWS
     ret_cols = [f"ret_+{w}w" for w in windows if f"ret_+{w}w" in eq_impact.columns]
     ar_cols  = [f"ar_+{w}w"  for w in windows if f"ar_+{w}w"  in eq_impact.columns]
 
@@ -262,7 +262,7 @@ def generate_event_impact_report(
     # ------------------------------------------------------------------ #
     # Console: Top indicator reactions per event
     # ------------------------------------------------------------------ #
-    if not ind_summary.empty:
+    '''if not ind_summary.empty:
         delta_cols = [f"delta_+{w}w" for w in windows if f"delta_+{w}w" in ind_summary.columns]
         print(f"\n--- Top {top_n} Indicators Reacting to Each Event (mean |Δz-score|) ---")
 
@@ -278,7 +278,7 @@ def generate_event_impact_report(
                     f"{r[c]:>+6.2f} " if not pd.isna(r.get(c)) else "   n/a "
                     for c in delta_cols
                 )
-                print(f"  {sheet[:15]}|{ind[:43]:<59} {deltas}")
+                print(f"  {sheet[:15]}|{ind[:43]:<59} {deltas}")'''
 
     # Overall most event-reactive features
     if not feat_score.empty:

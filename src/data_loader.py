@@ -38,7 +38,7 @@ def _parse_frequency(sheet_name: str) -> str:
     return "Unknown"
 
 
-def load_indicators() -> dict[str, pd.DataFrame]:
+def load_indicators(argtoday) -> dict[str, pd.DataFrame]:
     """
     Returns a dict keyed by sheet name.
     Each value is a DataFrame indexed by date with numeric indicator columns.
@@ -73,12 +73,14 @@ def load_indicators() -> dict[str, pd.DataFrame]:
         data.attrs["frequency"] = freq
         data.attrs["category"] = sheet.split("_")[0] if "_" in sheet else sheet
 
+        data = data[data.index <= argtoday]  # Filter out future data
+
         result[sheet] = data
 
     return result
 
 
-def load_equity(target, code) -> pd.DataFrame:
+def load_equity(target, code, argtoday) -> pd.DataFrame:
     """
     Returns a DataFrame with columns ['price', 'eps'] indexed by date.
     """
@@ -99,5 +101,7 @@ def load_equity(target, code) -> pd.DataFrame:
 
     # Rename to standard names
     data.columns = [target]
+
+    data = data[data.index <= argtoday]  # Filter out future data
 
     return data

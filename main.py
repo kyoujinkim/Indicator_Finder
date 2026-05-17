@@ -23,8 +23,10 @@ Usage:
 
 import argparse
 import time
+from datetime import date
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 from src.data_loader import load_indicators, load_equity
 from src.preprocessor import build_feature_matrix
@@ -66,6 +68,13 @@ def parse_args():
         "--all", action="store_true",
         help="Analyze all codes in the equity list (overrides --code)"
     )
+    parser.add_argument(
+        "--s_len", type=int, default=3,
+        help="Minimum length of sector code to analyze (default: 3)"
+    )
+    parser.add_argument(
+        "--date", type=str, default=None,
+    )
     return parser.parse_args()
 
 
@@ -77,8 +86,11 @@ def main(args):
     # ── 1. Load ──────────────────────────────────────────────────
     t0 = time.time()
     print("\n[1/9] Loading data...")
-    indicators = load_indicators()
-    equity = load_equity(args.target, args.code)
+    indicators = load_indicators(args.date)
+    equity = load_equity(args.target, args.code, args.date)
+    if len(equity.loc[pd.to_datetime(args.date)-relativedelta(years=1):args.date]) < 40:
+        print(f"      Loaded {len(equity)} equity rows. Since there is not enough data, skip analysis.")
+        return False
     print(f"      Loaded {len(indicators)} indicator sheets, {len(equity)} equity rows")
 
     # ── 2. Preprocess ─────────────────────────────────────────────
@@ -174,20 +186,25 @@ def main(args):
     elapsed = time.time() - t0
     print(f"\nTotal runtime: {elapsed:.1f}s")
 
+    return True
+
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.date == None:
+        args.date = date.today().strftime("%Y-%m-%d")
 
     if args.all:
         equ_list = pd.read_excel("data/equity.xlsx", sheet_name="list", header=0)
-        length = 3
-        equ_list = equ_list[equ_list.Length <= length]
+        start_length = args.s_len - 2
+        total_length = args.s_len
+        equ_list = equ_list[(start_length < equ_list.Length) & (equ_list.Length <= total_length)]
         equs = equ_list["Code"].tolist()
-        print(f"Analyzing equities with length ≤ {length}: {equs}")
+        print(f"Analyzing equities with length ≤ {total_length}: {equs}")
         for code in equs:
             args.code = code
             print(f"\n{'#' * 60}")
-            print(f" Analyzing {code} (length={length})")
+            print(f" Analyzing {code} (length={total_length})")
             print(f"{'#' * 60}")
             main(args)
     else:

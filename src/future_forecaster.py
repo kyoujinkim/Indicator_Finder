@@ -28,6 +28,7 @@ Public API:
 """
 
 import glob
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -37,15 +38,14 @@ from scipy.stats import norm as _norm
 from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 
-from .config import (
-    OUTPUT_DIR, DATA_DIR, FORECAST_DIR, IMPACTS_FILE,
+from src.config import (
+    OUTPUT_DIR, FORECAST_DIR, IMPACTS_FILE,
     FORECAST_WINDOWS as WINDOWS,
     WINDOW_TO_AR_COL as _WINDOW_TO_AR_COL,
     EWMA_SPAN,
     ARG_SCALE as _ARG_SCALE,
     HORIZON_DAMPENING,
     BASELINE_WINDOW,
-    ARG_LABEL as _ARG_LABEL,
 )
 
 
@@ -125,20 +125,25 @@ def _active_windows(days_since: int) -> dict[str, str]:
     Maps the remaining horizon from today to the nearest available ar_ column.
     Slots whose effective w1 >= 26 are excluded (event too old for that window).
     """
+    BUCKETS = [
+        ("1w", 1), ("2w", 2), ("4w", 4), ("8w", 8),
+        ("13w", 13), ("17w", 17), ("21w", 21), ("26w", 26)
+    ]
+
     adjusted: dict[str, str] = {}
-    for label, n in zip(["1w", "2w", "4w", "13w", "26w"], [1, 2, 4, 13, 26]):
-        w1 = abs(-(days_since + n * 7) // 7)
-        if w1 < 1:
-            adjusted[label] = "1w"
-        elif w1 < 2:
-            adjusted[label] = "2w"
-        elif w1 < 4:
-            adjusted[label] = "4w"
-        elif w1 < 13:
-            adjusted[label] = "13w"
-        elif w1 < 26:
-            adjusted[label] = "26w"
-        # else: slot inactive — omit from dict
+    for label, n in BUCKETS:
+        remaining_days = days_since + n * 7
+
+        if remaining_days <= 0:
+            continue
+
+        total_weeks = math.ceil(remaining_days/7)
+
+        for bucket_label, limit in BUCKETS:
+            if total_weeks < limit:
+                adjusted[label] = bucket_label
+                break
+
     return adjusted
 
 
@@ -212,6 +217,11 @@ def fit_base_model(
     )
     model.fit(X_scaled, y)
 
+    trailing_history = {
+        f: feature_matrix[f].iloc[-5:]
+        for f in available
+    }
+
     trailing_ewma = {
         f: float(feature_matrix[f].ewm(span=EWMA_SPAN).mean().iloc[-1])
         for f in available
@@ -231,6 +241,7 @@ def fit_base_model(
         "features":          available,
         "coefs":             coefs,
         "nonzero_coefs":     nonzero,
+        "trailing_history":  trailing_history,
         "trailing_ewma":     trailing_ewma,
         "trailing_feat_std": trailing_feat_std,
         "trailing_std":      float(np.std(y)),
@@ -256,6 +267,7 @@ def prepare_model(
     comparison = load_comparison(code, target)
     features   = select_base_features(report, comparison, top_n)
     artifacts  = fit_base_model(feature_matrix, target, features)
+
     return artifacts, features
 
 
@@ -265,7 +277,7 @@ def prepare_model(
 
 def _base_forecast(
     model_artifacts: dict,
-    feature_args: dict[str, int] | None = None,
+    feature_args: dict[str, float] | None = None,
     horizon_damp: float = HORIZON_DAMPENING,
 ) -> tuple[dict, dict[str, float]]:
     """
@@ -309,6 +321,8 @@ def _event_adjustment(
     """
     if today is None:
         today = datetime.today()
+    else:
+        today = pd.to_datetime(today)
 
     events_df   = _load_events()
     adjustments = {w: 0.0 for w in WINDOWS}
@@ -324,7 +338,6 @@ def _event_adjustment(
         if not active:
             continue
 
-        decay = _event_decay_weight(days_since)
         match = equity_summary[equity_summary["event_name"] == event_name]
         if match.empty:
             continue
@@ -334,6 +347,8 @@ def _event_adjustment(
         for slot, lookup_window in active.items():
             ar_col = _WINDOW_TO_AR_COL[lookup_window]
             if ar_col in row.index and pd.notna(row[ar_col]):
+                temp_days_since = max(days_since + int(slot.replace('w','')) * 7, 1)
+                decay = _event_decay_weight(temp_days_since, half_life=30)
                 c = float(row[ar_col]) * decay * event_prob
                 adjustments[slot] += c
                 contribs[slot]     = c
@@ -359,7 +374,7 @@ def run_forecast(
     feature_matrix: pd.DataFrame,
     code: str,
     target: str,
-    feature_args: dict[str, int] | None = None,
+    feature_args: dict[str, float] | None = None,
     model_artifacts: dict | None = None,
     top_n: int = 10,
     today: datetime | None = None,
@@ -484,7 +499,7 @@ def print_forecast_report(result: dict) -> None:
 
     print(f"\n{'=' * 85}")
     print(f"  MFMEA - Future {target.upper()} Forecast")
-    print(f"  As of: {today.strftime('%Y-%m-%d')}  |  Current {target}: {current:,.2f}  |  CI: {ci_pct}%")
+    print(f"  As of: {today}  |  Current {target}: {current:,.2f}  |  CI: {ci_pct}%")
     print(f"{'=' * 85}")
     print(f"\n  {'Window':<6} {'Horizon':>8} {'Base':>9} {'EvtAdj':>9} "
           f"{'Total':>9} {'Dir':>5} {'Projected':>12} {'Lower':>12} {'Upper':>12}  ({ci_pct}% CI)")
@@ -516,9 +531,8 @@ def print_forecast_report(result: dict) -> None:
     print(f"  {'-' * 80}")
     for feat, coef in nz[:10]:
         arg_val = feature_args.get(feat, 0)
-        arg_str = f"{arg_val:+d} ({_ARG_LABEL.get(arg_val, '')})" if arg_val != 0 else "0"
         cur_val = model["trailing_ewma"].get(feat, float("nan"))
-        print(f"  {coef:>+8.4f}  {cur_val:>13.4f}  {arg_str:<18}  {feat}")
+        print(f"  {coef:>+8.4f}  {cur_val:>13.4f}  {feat}")
 
     print(f"{'=' * 85}\n")
 
@@ -532,7 +546,7 @@ def save_forecast_report(code: str, result: dict, save: bool = True) -> Path | N
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     target = result["target"]
-    path   = FORECAST_DIR / f"mfmea_forecast_{code}_{target}_{result['today'].strftime('%Y%m%d_%H%M%S')}.xlsx"
+    path   = FORECAST_DIR / f"mfmea_forecast_{code}_{target}_{result['today']}.xlsx"
     wb     = Workbook()
 
     # Sheet 1: Forecast
@@ -586,7 +600,7 @@ def save_forecast_report(code: str, result: dict, save: bool = True) -> Path | N
             "current_ewma":  model["trailing_ewma"].get(feat, float("nan")),
             "nudged_ewma":   model["nudge_ewma"].get(feat, float("nan")),
             "expect":        fa.get(feat, 0),
-            "expect_label":  _ARG_LABEL.get(fa.get(feat, 0), ""),
+            "expect_label":  "Increase" if fa.get(feat, 0) > 0 else ("Decrease" if fa.get(feat, 0) < 0 else "Neutral"),
         }
         for feat, coef in sorted(model["coefs"].items(), key=lambda x: abs(x[1]), reverse=True)
     ])
